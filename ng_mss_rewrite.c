@@ -212,11 +212,17 @@ NETGRAPH_INIT(mss_rewrite, &ng_mss_rewrite_typestruct);
  * Helper function to update TCP checksum incrementally (RFC 1624)
  * HC' = ~(~HC + ~m + m')
  * Where HC is old checksum, m is old data, m' is new data
+ * All parameters are in network byte order, returns network byte order
  */
 static uint16_t
 tcp_checksum_adjust(uint16_t old_check, uint16_t old_data, uint16_t new_data)
 {
 	uint32_t sum;
+
+	/* Convert to host order for calculation */
+	old_check = ntohs(old_check);
+	old_data = ntohs(old_data);
+	new_data = ntohs(new_data);
 
 	sum = ~old_check & 0xffff;
 	sum += ~old_data & 0xffff;
@@ -224,7 +230,8 @@ tcp_checksum_adjust(uint16_t old_check, uint16_t old_data, uint16_t new_data)
 	sum = (sum >> 16) + (sum & 0xffff);
 	sum += (sum >> 16);
 
-	return (~sum);
+	/* Convert back to network order */
+	return (htons(~sum));
 }
 
 /* Process and possibly rewrite MSS in a packet - optimized version */
@@ -305,7 +312,7 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m, int *rewritten)
 			return (m);
 
 		/* Verify IP total length doesn't exceed actual packet length */
-		if (ntohs(ip4->ip_len) > m->m_pkthdr.len - (offset - ip_hlen))
+		if (ntohs(ip4->ip_len) > m->m_pkthdr.len - offset)
 			return (m);
 
 		max_mss = priv->mss_ipv4;
@@ -323,7 +330,7 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m, int *rewritten)
 			return (m);
 
 		/* Verify IPv6 payload length doesn't exceed actual packet length */
-		if (ntohs(ip6->ip6_plen) > m->m_pkthdr.len - offset)
+		if (ntohs(ip6->ip6_plen) > m->m_pkthdr.len - offset - sizeof(struct ip6_hdr))
 			return (m);
 
 		max_mss = priv->mss_ipv6;
@@ -419,7 +426,7 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m, int *rewritten)
 				}
 
 				/* Update TCP checksum incrementally (RFC 1624) */
-				tcp->th_sum = tcp_checksum_adjust(tcp->th_sum, old_mss, max_mss);
+				tcp->th_sum = tcp_checksum_adjust(tcp->th_sum, htons(old_mss), htons(max_mss));
 
 				/* Rewrite MSS */
 				options[i + 2] = (max_mss >> 8) & 0xff;
