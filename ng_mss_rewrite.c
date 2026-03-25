@@ -208,69 +208,19 @@ static struct ng_type ng_mss_rewrite_typestruct = {
 };
 NETGRAPH_INIT(mss_rewrite, &ng_mss_rewrite_typestruct);
 
-/* Helper function to calculate TCP checksum */
+/*
+ * Helper function to update TCP checksum incrementally (RFC 1624)
+ * HC' = ~(~HC + ~m + m')
+ * Where HC is old checksum, m is old data, m' is new data
+ */
 static uint16_t
-tcp_checksum_ipv4(struct ip *ip, struct tcphdr *tcp, int tcplen)
+tcp_checksum_adjust(uint16_t old_check, uint16_t old_data, uint16_t new_data)
 {
-	uint32_t sum = 0;
-	uint16_t *buf;
-	int len;
+	uint32_t sum;
 
-	/* Pseudo header */
-	sum += (ip->ip_src.s_addr >> 16) & 0xffff;
-	sum += ip->ip_src.s_addr & 0xffff;
-	sum += (ip->ip_dst.s_addr >> 16) & 0xffff;
-	sum += ip->ip_dst.s_addr & 0xffff;
-	sum += htons(IPPROTO_TCP);
-	sum += htons(tcplen);
-
-	/* TCP header and data */
-	buf = (uint16_t *)tcp;
-	len = tcplen;
-
-	while (len > 1) {
-		sum += *buf++;
-		len -= 2;
-	}
-
-	if (len == 1)
-		sum += *(uint8_t *)buf;
-
-	sum = (sum >> 16) + (sum & 0xffff);
-	sum += (sum >> 16);
-
-	return (~sum);
-}
-
-/* Helper function to calculate TCP checksum for IPv6 */
-static uint16_t
-tcp_checksum_ipv6(struct ip6_hdr *ip6, struct tcphdr *tcp, int tcplen)
-{
-	uint32_t sum = 0;
-	uint16_t *buf;
-	int len;
-	int i;
-
-	/* Pseudo header */
-	buf = (uint16_t *)&ip6->ip6_src;
-	for (i = 0; i < 16; i++)
-		sum += *buf++;
-
-	sum += htons(IPPROTO_TCP);
-	sum += htons(tcplen);
-
-	/* TCP header and data */
-	buf = (uint16_t *)tcp;
-	len = tcplen;
-
-	while (len > 1) {
-		sum += *buf++;
-		len -= 2;
-	}
-
-	if (len == 1)
-		sum += *(uint8_t *)buf;
-
+	sum = ~old_check & 0xffff;
+	sum += ~old_data & 0xffff;
+	sum += new_data;
 	sum = (sum >> 16) + (sum & 0xffff);
 	sum += (sum >> 16);
 
@@ -421,24 +371,6 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m, int *rewritten)
 		tcp = (struct tcphdr *)(pkt + offset);
 	}
 
-	/* Make mbuf writable if needed */
-	if (M_WRITABLE(m) == 0) {
-		struct mbuf *m_new = m_dup(m, M_NOWAIT);
-		if (m_new == NULL) {
-			m_freem(m);
-			return (NULL);
-		}
-		m_freem(m);
-		m = m_new;
-		/* Recalculate pointers */
-		pkt = mtod(m, uint8_t *);
-		if (ip4)
-			ip4 = (struct ip *)(pkt + offset - ip_hlen);
-		if (ip6)
-			ip6 = (struct ip6_hdr *)(pkt + offset - ip_hlen);
-		tcp = (struct tcphdr *)(pkt + offset);
-	}
-
 	/* Search for MSS option in TCP options */
 	options = (uint8_t *)(tcp + 1);
 	opt_len = tcp_hlen - sizeof(struct tcphdr);
@@ -467,19 +399,31 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m, int *rewritten)
 			uint16_t old_mss = (options[i + 2] << 8) | options[i + 3];
 
 			if (old_mss > max_mss) {
+				/* MSS rewrite needed - make mbuf writable now */
+				if (M_WRITABLE(m) == 0) {
+					struct mbuf *m_new = m_dup(m, M_NOWAIT);
+					if (m_new == NULL) {
+						m_freem(m);
+						return (NULL);
+					}
+					m_freem(m);
+					m = m_new;
+					/* Recalculate pointers */
+					pkt = mtod(m, uint8_t *);
+					if (ip4)
+						ip4 = (struct ip *)(pkt + offset - ip_hlen);
+					if (ip6)
+						ip6 = (struct ip6_hdr *)(pkt + offset - ip_hlen);
+					tcp = (struct tcphdr *)(pkt + offset);
+					options = (uint8_t *)(tcp + 1);
+				}
+
+				/* Update TCP checksum incrementally (RFC 1624) */
+				tcp->th_sum = tcp_checksum_adjust(tcp->th_sum, old_mss, max_mss);
+
 				/* Rewrite MSS */
 				options[i + 2] = (max_mss >> 8) & 0xff;
 				options[i + 3] = max_mss & 0xff;
-
-				/* Recalculate TCP checksum */
-				tcp->th_sum = 0;
-				if (ip4) {
-					int tcplen = ntohs(ip4->ip_len) - ip_hlen;
-					tcp->th_sum = tcp_checksum_ipv4(ip4, tcp, tcplen);
-				} else if (ip6) {
-					int tcplen = ntohs(ip6->ip6_plen);
-					tcp->th_sum = tcp_checksum_ipv6(ip6, tcp, tcplen);
-				}
 
 				*rewritten = 1;
 
