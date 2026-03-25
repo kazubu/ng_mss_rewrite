@@ -1,0 +1,14 @@
+# Build artifacts
+*.o
+*.ko
+*.ko.debug
+*.ko.symbols
+.depend
+export_syms
+machine
+x86
+.*.swp
+*~
+
+# Test outputs
+*.pcap
