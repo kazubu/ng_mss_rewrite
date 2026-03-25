@@ -248,16 +248,12 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m, int *rewritten)
 	int offset = 0;
 	int pullup_len;
 	uint16_t max_mss;
+	uint16_t plen;
 #if ENABLE_STATS
 	uint8_t stats_mode;  /* Snapshot stats mode once per packet */
 #endif
 
 	*rewritten = 0;
-
-#if ENABLE_STATS
-	/* Snapshot stats mode (plain load, no fence needed since stats_percpu never freed) */
-	stats_mode = priv->stats_mode;
-#endif
 
 	/* Fast path: ensure minimum packet length */
 	if (m->m_pkthdr.len < sizeof(struct ether_header) + sizeof(struct ip) + sizeof(struct tcphdr))
@@ -307,11 +303,12 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m, int *rewritten)
 			return (m);
 
 		/* Verify minimum packet length for TCP */
-		if (ntohs(ip4->ip_len) < ip_hlen + (int)sizeof(struct tcphdr))
+		plen = ntohs(ip4->ip_len);
+		if (plen < ip_hlen + (int)sizeof(struct tcphdr))
 			return (m);
 
 		/* Verify IP total length doesn't exceed actual packet length */
-		if (ntohs(ip4->ip_len) > m->m_pkthdr.len - offset)
+		if (plen > m->m_pkthdr.len - offset)
 			return (m);
 
 		max_mss = priv->mss_ipv4;
@@ -328,8 +325,9 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m, int *rewritten)
 		if (ip6->ip6_nxt != IPPROTO_TCP)
 			return (m);
 
-		/* Verify IPv6 payload length doesn't exceed actual packet length */
-		if (ntohs(ip6->ip6_plen) > m->m_pkthdr.len - offset - sizeof(struct ip6_hdr))
+		/* Verify payload length is valid for a TCP header */
+		plen = ntohs(ip6->ip6_plen);
+		if (plen < (int)sizeof(struct tcphdr) || plen > m->m_pkthdr.len - offset - (int)sizeof(struct ip6_hdr))
 			return (m);
 
 		max_mss = priv->mss_ipv6;
@@ -358,6 +356,9 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m, int *rewritten)
 		return (m);
 
 #if ENABLE_STATS
+	/* Snapshot stats mode (plain load, no fence needed since stats_percpu never freed) */
+	stats_mode = priv->stats_mode;
+
 	/* Increment SYN packets counter (if not disabled) */
 	if (stats_mode == STATS_MODE_PERCPU)
 		priv->stats_percpu[curcpu].packets_processed++;
