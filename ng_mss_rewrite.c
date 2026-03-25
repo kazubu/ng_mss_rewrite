@@ -48,8 +48,8 @@
 #define MAX_HDR_LEN		(ETHER_HDR_LEN + ETHER_VLAN_ENCAP_LEN + 60 + 60)
 
 /* Statistics modes */
-#define STATS_MODE_DISABLED	0	/* No statistics collection (fastest) */
-#define STATS_MODE_PERCPU	1	/* Per-CPU counters (minimal overhead, default) */
+#define STATS_MODE_DISABLED	0	/* No statistics collection (fastest, default) */
+#define STATS_MODE_PERCPU	1	/* Per-CPU counters (minimal overhead) */
 
 /* Compile-time statistics control (set to 0 to disable all stats) */
 #ifndef ENABLE_STATS
