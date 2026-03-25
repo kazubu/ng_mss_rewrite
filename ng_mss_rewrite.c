@@ -12,6 +12,7 @@
 #include <sys/malloc.h>
 #include <sys/errno.h>
 #include <sys/socket.h>
+#include <machine/atomic.h>
 
 #include <net/if.h>
 #include <net/if_var.h>
@@ -39,6 +40,9 @@
 /* Default MSS values */
 #define DEFAULT_MSS_IPV4	1400
 #define DEFAULT_MSS_IPV6	1380
+
+/* Maximum header size to pull up at once (optimization) */
+#define MAX_HDR_LEN		(ETHER_HDR_LEN + ETHER_VLAN_ENCAP_LEN + 60 + 60)
 
 /* Private node data */
 struct ng_mss_rewrite_private {
@@ -236,149 +240,130 @@ tcp_checksum_ipv6(struct ip6_hdr *ip6, struct tcphdr *tcp, int tcplen)
 	return (~sum);
 }
 
-/* Process and possibly rewrite MSS in a packet */
-static int
-ng_mss_rewrite_process(priv_p priv, struct mbuf *m)
+/* Process and possibly rewrite MSS in a packet - optimized version */
+static struct mbuf *
+ng_mss_rewrite_process(priv_p priv, struct mbuf *m, int *rewritten)
 {
 	struct ether_header *eh;
 	struct ip *ip4 = NULL;
 	struct ip6_hdr *ip6 = NULL;
 	struct tcphdr *tcp;
-	uint8_t *options;
+	uint8_t *options, *pkt;
 	uint16_t ether_type;
 	int ip_hlen, tcp_hlen, opt_len, i;
 	int offset = 0;
+	int pullup_len;
 	uint16_t max_mss;
-	int rewritten = 0;
 
-	/* Ensure we have enough data */
-	if (m->m_pkthdr.len < sizeof(struct ether_header))
-		return (0);
+	*rewritten = 0;
 
-	/* Make sure the Ethernet header is contiguous */
-	if (m->m_len < sizeof(struct ether_header)) {
-		m = m_pullup(m, sizeof(struct ether_header));
+	/* Fast path: ensure minimum packet length */
+	if (m->m_pkthdr.len < sizeof(struct ether_header) + sizeof(struct ip) + sizeof(struct tcphdr))
+		return (m);
+
+	/* Optimize: pull up headers in one go (most packets fit in single mbuf) */
+	pullup_len = min(m->m_pkthdr.len, MAX_HDR_LEN);
+	if (m->m_len < pullup_len) {
+		m = m_pullup(m, pullup_len);
 		if (m == NULL)
-			return (0);
+			return (NULL);
 	}
 
-	eh = mtod(m, struct ether_header *);
+	pkt = mtod(m, uint8_t *);
+	eh = (struct ether_header *)pkt;
 	ether_type = ntohs(eh->ether_type);
 	offset = sizeof(struct ether_header);
 
 	/* Handle VLAN tag */
 	if (ether_type == ETHERTYPE_VLAN) {
 		if (m->m_pkthdr.len < offset + 4)
-			return (0);
-
-		if (m->m_len < offset + 4) {
-			m = m_pullup(m, offset + 4);
-			if (m == NULL)
-				return (0);
-		}
-
-		ether_type = ntohs(*(uint16_t *)(mtod(m, uint8_t *) + offset + 2));
+			return (m);
+		ether_type = ntohs(*(uint16_t *)(pkt + offset + 2));
 		offset += 4;
 	}
 
-	/* Check if it's IP */
+	/* Check IP version and protocol */
 	if (ether_type == ETHERTYPE_IP) {
-		/* IPv4 */
-		max_mss = priv->mss_ipv4;
-
 		if (m->m_pkthdr.len < offset + sizeof(struct ip))
-			return (0);
+			return (m);
 
-		if (m->m_len < offset + sizeof(struct ip)) {
-			m = m_pullup(m, offset + sizeof(struct ip));
-			if (m == NULL)
-				return (0);
-		}
-
-		ip4 = (struct ip *)(mtod(m, uint8_t *) + offset);
+		ip4 = (struct ip *)(pkt + offset);
 		ip_hlen = ip4->ip_hl << 2;
 
-		/* Check if it's TCP */
+		/* Fast path: not TCP */
 		if (ip4->ip_p != IPPROTO_TCP)
-			return (0);
+			return (m);
 
+		max_mss = priv->mss_ipv4;
 		offset += ip_hlen;
 
 	} else if (ether_type == ETHERTYPE_IPV6) {
-		/* IPv6 */
-		max_mss = priv->mss_ipv6;
-
 		if (m->m_pkthdr.len < offset + sizeof(struct ip6_hdr))
-			return (0);
+			return (m);
 
-		if (m->m_len < offset + sizeof(struct ip6_hdr)) {
-			m = m_pullup(m, offset + sizeof(struct ip6_hdr));
-			if (m == NULL)
-				return (0);
-		}
-
-		ip6 = (struct ip6_hdr *)(mtod(m, uint8_t *) + offset);
-
-		/* Check if it's TCP (simplified, not handling extension headers) */
-		if (ip6->ip6_nxt != IPPROTO_TCP)
-			return (0);
-
-		offset += sizeof(struct ip6_hdr);
+		ip6 = (struct ip6_hdr *)(pkt + offset);
 		ip_hlen = sizeof(struct ip6_hdr);
+
+		/* Fast path: not TCP (simplified, not handling extension headers) */
+		if (ip6->ip6_nxt != IPPROTO_TCP)
+			return (m);
+
+		max_mss = priv->mss_ipv6;
+		offset += ip_hlen;
 
 	} else {
 		/* Not IP */
-		return (0);
+		return (m);
 	}
 
 	/* Check TCP header */
 	if (m->m_pkthdr.len < offset + sizeof(struct tcphdr))
-		return (0);
+		return (m);
 
-	if (m->m_len < offset + sizeof(struct tcphdr)) {
-		m = m_pullup(m, offset + sizeof(struct tcphdr));
-		if (m == NULL)
-			return (0);
-	}
-
-	tcp = (struct tcphdr *)(mtod(m, uint8_t *) + offset);
+	tcp = (struct tcphdr *)(pkt + offset);
 	tcp_hlen = tcp->th_off << 2;
 
-	/* Check if it's a SYN packet */
+	/* Fast path: not a SYN packet */
 	if (!(tcp->th_flags & TH_SYN))
-		return (0);
+		return (m);
 
-	/* Make sure we have the full TCP header with options */
+	/* Increment processed counter (atomic) */
+	atomic_add_64(&priv->packets_processed, 1);
+
+	/* Ensure we have full TCP header with options */
 	if (m->m_pkthdr.len < offset + tcp_hlen)
-		return (0);
+		return (m);
 
+	/* If we didn't pull up enough, do it now (rare case) */
 	if (m->m_len < offset + tcp_hlen) {
 		m = m_pullup(m, offset + tcp_hlen);
 		if (m == NULL)
-			return (0);
-
-		/* Recalculate pointers after m_pullup */
+			return (NULL);
+		/* Recalculate pointers */
+		pkt = mtod(m, uint8_t *);
 		if (ip4)
-			ip4 = (struct ip *)(mtod(m, uint8_t *) + offset - ip_hlen);
+			ip4 = (struct ip *)(pkt + offset - ip_hlen);
 		if (ip6)
-			ip6 = (struct ip6_hdr *)(mtod(m, uint8_t *) + offset - ip_hlen);
-		tcp = (struct tcphdr *)(mtod(m, uint8_t *) + offset);
+			ip6 = (struct ip6_hdr *)(pkt + offset - ip_hlen);
+		tcp = (struct tcphdr *)(pkt + offset);
 	}
 
-	/* Make mbuf writable */
+	/* Make mbuf writable if needed */
 	if (M_WRITABLE(m) == 0) {
 		struct mbuf *m_new = m_dup(m, M_NOWAIT);
-		if (m_new == NULL)
-			return (0);
+		if (m_new == NULL) {
+			m_freem(m);
+			return (NULL);
+		}
 		m_freem(m);
 		m = m_new;
-
 		/* Recalculate pointers */
+		pkt = mtod(m, uint8_t *);
 		if (ip4)
-			ip4 = (struct ip *)(mtod(m, uint8_t *) + offset - ip_hlen);
+			ip4 = (struct ip *)(pkt + offset - ip_hlen);
 		if (ip6)
-			ip6 = (struct ip6_hdr *)(mtod(m, uint8_t *) + offset - ip_hlen);
-		tcp = (struct tcphdr *)(mtod(m, uint8_t *) + offset);
+			ip6 = (struct ip6_hdr *)(pkt + offset - ip_hlen);
+		tcp = (struct tcphdr *)(pkt + offset);
 	}
 
 	/* Search for MSS option in TCP options */
@@ -423,7 +408,8 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m)
 					tcp->th_sum = tcp_checksum_ipv6(ip6, tcp, tcplen);
 				}
 
-				rewritten = 1;
+				*rewritten = 1;
+				atomic_add_64(&priv->packets_rewritten, 1);
 			}
 			break;
 		}
@@ -431,11 +417,7 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m)
 		i += opt_size;
 	}
 
-	priv->packets_processed++;
-	if (rewritten)
-		priv->packets_rewritten++;
-
-	return (rewritten);
+	return (m);
 }
 
 /*
@@ -587,7 +569,6 @@ ng_mss_rewrite_rcvdata(hook_p hook, item_p item)
 	int error = 0;
 
 	NGI_GET_M(item, m);
-	NG_FREE_ITEM(item);
 
 	/* Determine output hook */
 	if (hook == priv->lower)
@@ -596,19 +577,32 @@ ng_mss_rewrite_rcvdata(hook_p hook, item_p item)
 		out_hook = priv->lower;
 	else {
 		m_freem(m);
+		NG_FREE_ITEM(item);
 		return (EINVAL);
 	}
 
 	if (out_hook == NULL) {
 		m_freem(m);
+		NG_FREE_ITEM(item);
 		return (ENOTCONN);
 	}
 
 	/* Process the packet */
-	ng_mss_rewrite_process(priv, m);
+	{
+		int rewritten;
+		m = ng_mss_rewrite_process(priv, m, &rewritten);
+		if (m == NULL) {
+			/* Packet was dropped during processing */
+			NG_FREE_ITEM(item);
+			return (0);
+		}
+	}
+
+	/* Put the (possibly modified) mbuf back into the item */
+	NGI_M(item) = m;
 
 	/* Forward the packet */
-	NG_FWD_NEW_DATA(error, item, out_hook, m);
+	NG_FWD_ITEM_HOOK(error, item, out_hook);
 
 	return (error);
 }
