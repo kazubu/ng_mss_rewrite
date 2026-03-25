@@ -47,9 +47,8 @@
 #define MAX_HDR_LEN		(ETHER_HDR_LEN + ETHER_VLAN_ENCAP_LEN + 60 + 60)
 
 /* Statistics modes */
-#define STATS_MODE_DISABLED	0	/* No statistics collection */
-#define STATS_MODE_GLOBAL	1	/* Global atomic counters (default) */
-#define STATS_MODE_PERCPU	2	/* Per-CPU counters (best performance) */
+#define STATS_MODE_DISABLED	0	/* No statistics collection (fastest) */
+#define STATS_MODE_PERCPU	1	/* Per-CPU counters (minimal overhead, default) */
 
 /* Compile-time statistics control (set to 0 to disable all stats) */
 #ifndef ENABLE_STATS
@@ -68,14 +67,14 @@ struct ng_mss_rewrite_private {
 	hook_p		upper;		/* Connection to kernel stack */
 	uint16_t	mss_ipv4;	/* MSS limit for IPv4 */
 	uint16_t	mss_ipv6;	/* MSS limit for IPv6 */
-	uint8_t		stats_mode;	/* Statistics mode */
+	uint8_t		stats_mode;	/* Statistics mode (can be changed at runtime) */
 
-	/* Global statistics (for STATS_MODE_GLOBAL) */
-	uint64_t	packets_processed;
-	uint64_t	packets_rewritten;
-
-	/* Per-CPU statistics (for STATS_MODE_PERCPU) */
+	/* Per-CPU statistics (allocated once, never freed until shutdown) */
 	struct ng_mss_stats_percpu *stats_percpu;
+
+	/* Baseline for resetstats (snapshot at last reset) */
+	uint64_t	baseline_processed;
+	uint64_t	baseline_rewritten;
 };
 typedef struct ng_mss_rewrite_private *priv_p;
 
@@ -288,8 +287,16 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m, int *rewritten)
 	int offset = 0;
 	int pullup_len;
 	uint16_t max_mss;
+#if ENABLE_STATS
+	uint8_t stats_mode;  /* Snapshot stats mode once per packet */
+#endif
 
 	*rewritten = 0;
+
+#if ENABLE_STATS
+	/* Snapshot stats mode atomically (avoid mid-packet mode changes) */
+	stats_mode = atomic_load_acq_8(&priv->stats_mode);
+#endif
 
 	/* Fast path: ensure minimum packet length */
 	if (m->m_pkthdr.len < sizeof(struct ether_header) + sizeof(struct ip) + sizeof(struct tcphdr))
@@ -324,8 +331,22 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m, int *rewritten)
 		ip4 = (struct ip *)(pkt + offset);
 		ip_hlen = ip4->ip_hl << 2;
 
+		/* Validate IPv4 header length */
+		if (ip_hlen < (int)sizeof(struct ip))
+			return (m);
+		if (m->m_pkthdr.len < offset + ip_hlen)
+			return (m);
+
 		/* Fast path: not TCP */
 		if (ip4->ip_p != IPPROTO_TCP)
+			return (m);
+
+		/* Skip fragmented packets (only first fragment has TCP header) */
+		if (ntohs(ip4->ip_off) & (IP_MF | IP_OFFMASK))
+			return (m);
+
+		/* Verify minimum packet length for TCP */
+		if (ntohs(ip4->ip_len) < ip_hlen + (int)sizeof(struct tcphdr))
 			return (m);
 
 		max_mss = priv->mss_ipv4;
@@ -357,28 +378,21 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m, int *rewritten)
 	tcp = (struct tcphdr *)(pkt + offset);
 	tcp_hlen = tcp->th_off << 2;
 
+	/* Validate TCP header length */
+	if (tcp_hlen < (int)sizeof(struct tcphdr))
+		return (m);
+	if (m->m_pkthdr.len < offset + tcp_hlen)
+		return (m);
+
 	/* Fast path: not a SYN packet */
 	if (!(tcp->th_flags & TH_SYN))
 		return (m);
 
 #if ENABLE_STATS
-	/* Increment processed counter based on stats mode */
-	switch (priv->stats_mode) {
-	case STATS_MODE_GLOBAL:
-		atomic_add_64(&priv->packets_processed, 1);
-		break;
-	case STATS_MODE_PERCPU:
+	/* Increment SYN packets counter (if not disabled) */
+	if (stats_mode == STATS_MODE_PERCPU)
 		priv->stats_percpu[curcpu].packets_processed++;
-		break;
-	case STATS_MODE_DISABLED:
-	default:
-		break;
-	}
 #endif
-
-	/* Ensure we have full TCP header with options */
-	if (m->m_pkthdr.len < offset + tcp_hlen)
-		return (m);
 
 	/* If we didn't pull up enough, do it now (rare case) */
 	if (m->m_len < offset + tcp_hlen) {
@@ -457,18 +471,9 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m, int *rewritten)
 				*rewritten = 1;
 
 #if ENABLE_STATS
-				/* Increment rewritten counter based on stats mode */
-				switch (priv->stats_mode) {
-				case STATS_MODE_GLOBAL:
-					atomic_add_64(&priv->packets_rewritten, 1);
-					break;
-				case STATS_MODE_PERCPU:
+				/* Increment rewritten counter (if not disabled) */
+				if (stats_mode == STATS_MODE_PERCPU)
 					priv->stats_percpu[curcpu].packets_rewritten++;
-					break;
-				case STATS_MODE_DISABLED:
-				default:
-					break;
-				}
 #endif
 			}
 			break;
@@ -534,8 +539,12 @@ ng_mss_rewrite_newhook(node_p node, hook_p hook, const char *name)
 	const priv_p priv = NG_NODE_PRIVATE(node);
 
 	if (strcmp(name, NG_MSS_REWRITE_HOOK_LOWER) == 0) {
+		if (priv->lower != NULL)
+			return (EISCONN);
 		priv->lower = hook;
 	} else if (strcmp(name, NG_MSS_REWRITE_HOOK_UPPER) == 0) {
+		if (priv->upper != NULL)
+			return (EISCONN);
 		priv->upper = hook;
 	} else {
 		return (EINVAL);
@@ -570,6 +579,13 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 			}
 
 			conf = (struct ng_mss_rewrite_conf *)msg->data;
+
+			/* Validate MSS values (must be non-zero) */
+			if (conf->mss_ipv4 == 0 || conf->mss_ipv6 == 0) {
+				error = EINVAL;
+				break;
+			}
+
 			priv->mss_ipv4 = conf->mss_ipv4;
 			priv->mss_ipv6 = conf->mss_ipv6;
 			break;
@@ -604,20 +620,21 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 			stats = (struct ng_mss_rewrite_stats *)resp->data;
 
 #if ENABLE_STATS
-			if (priv->stats_mode == STATS_MODE_PERCPU) {
-				/* Aggregate per-CPU statistics */
+			/* Aggregate per-CPU counters */
+			stats->packets_processed = 0;
+			stats->packets_rewritten = 0;
+
+			if (priv->stats_percpu != NULL) {
 				int cpu;
-				stats->packets_processed = 0;
-				stats->packets_rewritten = 0;
 				for (cpu = 0; cpu < mp_ncpus; cpu++) {
 					stats->packets_processed += priv->stats_percpu[cpu].packets_processed;
 					stats->packets_rewritten += priv->stats_percpu[cpu].packets_rewritten;
 				}
-			} else {
-				/* Use global counters */
-				stats->packets_processed = priv->packets_processed;
-				stats->packets_rewritten = priv->packets_rewritten;
 			}
+
+			/* Subtract baseline (for resetstats support) */
+			stats->packets_processed -= priv->baseline_processed;
+			stats->packets_rewritten -= priv->baseline_rewritten;
 #else
 			stats->packets_processed = 0;
 			stats->packets_rewritten = 0;
@@ -627,18 +644,21 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 
 		case NGM_MSS_REWRITE_RESET_STATS:
 #if ENABLE_STATS
-			if (priv->stats_mode == STATS_MODE_PERCPU) {
-				/* Reset per-CPU statistics */
+		{
+			/* Baseline method: snapshot current total, don't zero live counters */
+			uint64_t total_processed = 0, total_rewritten = 0;
+
+			if (priv->stats_percpu != NULL) {
 				int cpu;
 				for (cpu = 0; cpu < mp_ncpus; cpu++) {
-					priv->stats_percpu[cpu].packets_processed = 0;
-					priv->stats_percpu[cpu].packets_rewritten = 0;
+					total_processed += priv->stats_percpu[cpu].packets_processed;
+					total_rewritten += priv->stats_percpu[cpu].packets_rewritten;
 				}
-			} else {
-				/* Reset global counters */
-				priv->packets_processed = 0;
-				priv->packets_rewritten = 0;
 			}
+
+			priv->baseline_processed = total_processed;
+			priv->baseline_rewritten = total_rewritten;
+		}
 #endif
 			break;
 
@@ -646,7 +666,6 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 		{
 #if ENABLE_STATS
 			struct ng_mss_rewrite_stats_mode *mode_conf;
-			uint8_t old_mode;
 
 			if (msg->header.arglen != sizeof(*mode_conf)) {
 				error = EINVAL;
@@ -655,15 +674,13 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 
 			mode_conf = (struct ng_mss_rewrite_stats_mode *)msg->data;
 
-			/* Validate mode */
-			if (mode_conf->mode > STATS_MODE_PERCPU) {
+			/* Validate mode (only DISABLED and PERCPU are supported) */
+			if (mode_conf->mode != STATS_MODE_DISABLED && mode_conf->mode != STATS_MODE_PERCPU) {
 				error = EINVAL;
 				break;
 			}
 
-			old_mode = priv->stats_mode;
-
-			/* Switching to per-CPU mode */
+			/* Lazy allocate per-CPU array if switching to PERCPU */
 			if (mode_conf->mode == STATS_MODE_PERCPU && priv->stats_percpu == NULL) {
 				priv->stats_percpu = malloc(sizeof(struct ng_mss_stats_percpu) * mp_ncpus,
 				    M_NETGRAPH, M_NOWAIT | M_ZERO);
@@ -673,15 +690,8 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 				}
 			}
 
-			/* Switching from per-CPU mode */
-			if (old_mode == STATS_MODE_PERCPU && mode_conf->mode != STATS_MODE_PERCPU) {
-				if (priv->stats_percpu != NULL) {
-					free(priv->stats_percpu, M_NETGRAPH);
-					priv->stats_percpu = NULL;
-				}
-			}
-
-			priv->stats_mode = mode_conf->mode;
+			/* Atomically update mode (never free stats_percpu) */
+			atomic_store_rel_8(&priv->stats_mode, mode_conf->mode);
 #else
 			error = EOPNOTSUPP;
 #endif
@@ -700,7 +710,7 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 
 			mode_conf = (struct ng_mss_rewrite_stats_mode *)resp->data;
 #if ENABLE_STATS
-			mode_conf->mode = priv->stats_mode;
+			mode_conf->mode = atomic_load_acq_8(&priv->stats_mode);
 #else
 			mode_conf->mode = STATS_MODE_DISABLED;
 #endif

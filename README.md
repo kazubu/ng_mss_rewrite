@@ -5,16 +5,33 @@ FreeBSD netgraph node for rewriting TCP MSS (Maximum Segment Size) option in SYN
 ## Features
 
 - Rewrites TCP MSS option in SYN packets
-- Supports both IPv4 and IPv6 with different MSS values
+- Supports IPv4 (all cases) and IPv6 (simple cases only, see limitations below)
 - Handles VLAN-tagged frames
 - Only rewrites if existing MSS > configured MSS (never increases MSS)
 - High performance (processes packets at line rate)
 - Works at L2 level on physical interface
 - Automatically applies to all VLANs/bridges/tunnels
-- **Three statistics modes for optimal performance:**
-  - **Disabled**: Zero overhead (compile-time option)
-  - **Global**: Atomic counters (5-10% overhead, safe for all scenarios)
-  - **Per-CPU**: Non-atomic counters (minimal overhead, best performance)
+- Validates packet headers and skips fragmented packets
+- **Two statistics modes for optimal performance:**
+  - **Disabled**: Zero overhead
+  - **Per-CPU**: Minimal overhead (~1-2%), default
+  - Runtime switchable without data loss
+
+## Limitations
+
+### IPv6 Support
+
+**Currently supports IPv6 packets where TCP immediately follows the IPv6 base header only.**
+
+- ✅ Works: IPv6 base header → TCP header
+- ❌ Does NOT work: IPv6 with extension headers (Hop-by-Hop, Routing, Fragment, etc.)
+
+This is a known limitation. Most IPv6 TCP SYN packets do not use extension headers, so this covers the majority of real-world traffic.
+
+### Other Limitations
+
+- Fragmented IPv4 packets are skipped (SYN packets are rarely fragmented)
+- Statistics counter `packets_processed` counts TCP SYN packets only, not all packets
 
 ## Requirements
 
@@ -145,28 +162,35 @@ Modes:
 - `1`: Global (atomic counters, safe for all scenarios)
 - `2`: Per-CPU (best performance, default)
 
-#### Set Statistics Mode
+#### Statistics Mode Control
 
+Statistics mode can be changed at runtime without losing accumulated data.
+
+**Get Current Mode:**
+```bash
+ngctl msg mss0: getstatsmode
+```
+
+Output: `{ mode=0 }` (DISABLED) or `{ mode=1 }` (PERCPU)
+
+**Set Statistics Mode:**
 ```bash
 # Disable statistics (maximum performance)
 ngctl msg mss0: setstatsmode "{ mode=0 }"
 
-# Enable global atomic counters
+# Enable per-CPU statistics (minimal overhead, recommended)
 ngctl msg mss0: setstatsmode "{ mode=1 }"
-
-# Enable per-CPU counters (best balance)
-ngctl msg mss0: setstatsmode "{ mode=2 }"
 ```
 
 **Performance Impact:**
-- **Disabled (0)**: Zero overhead, ~5-20% faster than per-CPU mode
-- **Per-CPU (2)**: Minimal overhead (~1-2%), recommended default
-- **Global (1)**: 5-10% overhead due to atomic operations and cache contention
+- **DISABLED (0)**: Zero overhead, ~5-10% faster
+- **PERCPU (1)**: Minimal overhead (~1-2%), default
 
-**When to use each mode:**
-- **Disabled**: Production environments where you don't need statistics
-- **Per-CPU**: Default, provides statistics with minimal overhead
-- **Global**: When you need 100% accurate real-time statistics (rarely needed)
+**Important Notes:**
+- Switching modes does NOT reset counters (baseline method)
+- Per-CPU array allocated once, never freed until node shutdown
+- Safe to switch modes at any time during operation
+- Use DISABLED mode in production for maximum performance
 
 ## Verification
 

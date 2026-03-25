@@ -27,7 +27,6 @@ kldstat | grep mss_rewrite
 Replace `em0` with your physical interface:
 
 ```bash
-cd test
 sudo ./setup.sh em0 1400 1380
 ```
 
@@ -74,20 +73,21 @@ ngctl msg em0_mss: getstats
 
 ## 6. Performance Tuning (Optional)
 
-For maximum performance in production, disable statistics:
+For maximum performance in production, disable statistics at runtime:
 
 ```bash
-# Disable statistics collection (5-20% faster)
+# Disable statistics (5-10% faster)
 ngctl msg em0_mss: setstatsmode "{ mode=0 }"
 
 # Check current mode
 ngctl msg em0_mss: getstatsmode
 ```
 
-Statistics modes:
-- **0**: Disabled (fastest, no overhead)
-- **1**: Global atomic counters
-- **2**: Per-CPU counters (default, recommended)
+**Statistics modes:**
+- **0**: DISABLED (fastest, no overhead)
+- **1**: PERCPU (minimal overhead ~1-2%, default)
+
+**Note**: Switching modes does not reset counters. You can freely switch between modes without losing data.
 
 ## 7. Manual Setup (Alternative)
 
