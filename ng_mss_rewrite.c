@@ -14,6 +14,7 @@
 #include <sys/socket.h>
 #include <sys/smp.h>
 #include <sys/pcpu.h>
+#include <sys/mutex.h>
 #include <machine/atomic.h>
 
 #include <net/if.h>
@@ -67,7 +68,7 @@ struct ng_mss_rewrite_private {
 	hook_p		upper;		/* Connection to kernel stack */
 	uint16_t	mss_ipv4;	/* MSS limit for IPv4 */
 	uint16_t	mss_ipv6;	/* MSS limit for IPv6 */
-	uint8_t		stats_mode;	/* Statistics mode (can be changed at runtime) */
+	volatile u_char	stats_mode;	/* Statistics mode (can be changed at runtime) */
 
 	/* Per-CPU statistics (allocated once, never freed until shutdown) */
 	struct ng_mss_stats_percpu *stats_percpu;
@@ -75,6 +76,9 @@ struct ng_mss_rewrite_private {
 	/* Baseline for resetstats (snapshot at last reset) */
 	uint64_t	baseline_processed;
 	uint64_t	baseline_rewritten;
+
+	/* Mutex for getstats/resetstats mutual exclusion */
+	struct mtx	stats_mtx;
 };
 typedef struct ng_mss_rewrite_private *priv_p;
 
@@ -294,8 +298,9 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m, int *rewritten)
 	*rewritten = 0;
 
 #if ENABLE_STATS
-	/* Snapshot stats mode atomically (avoid mid-packet mode changes) */
-	stats_mode = atomic_load_acq_8(&priv->stats_mode);
+	/* Snapshot stats mode with acquire semantics (avoid mid-packet mode changes) */
+	stats_mode = priv->stats_mode;
+	atomic_thread_fence_acq();
 #endif
 
 	/* Fast path: ensure minimum packet length */
@@ -349,6 +354,10 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m, int *rewritten)
 		if (ntohs(ip4->ip_len) < ip_hlen + (int)sizeof(struct tcphdr))
 			return (m);
 
+		/* Verify IP total length doesn't exceed actual packet length */
+		if (ntohs(ip4->ip_len) > m->m_pkthdr.len - (offset - ip_hlen))
+			return (m);
+
 		max_mss = priv->mss_ipv4;
 		offset += ip_hlen;
 
@@ -361,6 +370,10 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m, int *rewritten)
 
 		/* Fast path: not TCP (simplified, not handling extension headers) */
 		if (ip6->ip6_nxt != IPPROTO_TCP)
+			return (m);
+
+		/* Verify IPv6 payload length doesn't exceed actual packet length */
+		if (ntohs(ip6->ip6_plen) > m->m_pkthdr.len - offset)
 			return (m);
 
 		max_mss = priv->mss_ipv6;
@@ -498,10 +511,13 @@ ng_mss_rewrite_constructor(node_p node)
 	priv->mss_ipv6 = DEFAULT_MSS_IPV6;
 
 #if ENABLE_STATS
-	/* Default to per-CPU statistics for best performance */
-	priv->stats_mode = STATS_MODE_PERCPU;
+	/* Default to disabled statistics for maximum performance */
+	priv->stats_mode = STATS_MODE_DISABLED;
+	/* Allocate per-CPU array immediately (never-free design) */
 	priv->stats_percpu = malloc(sizeof(struct ng_mss_stats_percpu) * mp_ncpus,
 	    M_NETGRAPH, M_WAITOK | M_ZERO);
+	/* Initialize mutex for getstats/resetstats */
+	mtx_init(&priv->stats_mtx, "ng_mss_stats", NULL, MTX_DEF);
 #else
 	priv->stats_mode = STATS_MODE_DISABLED;
 	priv->stats_percpu = NULL;
@@ -520,8 +536,12 @@ ng_mss_rewrite_shutdown(node_p node)
 {
 	const priv_p priv = NG_NODE_PRIVATE(node);
 
-	if (priv->stats_percpu != NULL)
+#if ENABLE_STATS
+	if (priv->stats_percpu != NULL) {
+		mtx_destroy(&priv->stats_mtx);
 		free(priv->stats_percpu, M_NETGRAPH);
+	}
+#endif
 
 	free(priv, M_NETGRAPH);
 	NG_NODE_SET_PRIVATE(node, NULL);
@@ -620,6 +640,9 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 			stats = (struct ng_mss_rewrite_stats *)resp->data;
 
 #if ENABLE_STATS
+			/* Lock to prevent race with resetstats */
+			mtx_lock(&priv->stats_mtx);
+
 			/* Aggregate per-CPU counters */
 			stats->packets_processed = 0;
 			stats->packets_rewritten = 0;
@@ -635,6 +658,8 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 			/* Subtract baseline (for resetstats support) */
 			stats->packets_processed -= priv->baseline_processed;
 			stats->packets_rewritten -= priv->baseline_rewritten;
+
+			mtx_unlock(&priv->stats_mtx);
 #else
 			stats->packets_processed = 0;
 			stats->packets_rewritten = 0;
@@ -648,6 +673,9 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 			/* Baseline method: snapshot current total, don't zero live counters */
 			uint64_t total_processed = 0, total_rewritten = 0;
 
+			/* Lock to prevent race with getstats */
+			mtx_lock(&priv->stats_mtx);
+
 			if (priv->stats_percpu != NULL) {
 				int cpu;
 				for (cpu = 0; cpu < mp_ncpus; cpu++) {
@@ -658,6 +686,8 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 
 			priv->baseline_processed = total_processed;
 			priv->baseline_rewritten = total_rewritten;
+
+			mtx_unlock(&priv->stats_mtx);
 		}
 #endif
 			break;
@@ -690,8 +720,9 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 				}
 			}
 
-			/* Atomically update mode (never free stats_percpu) */
-			atomic_store_rel_8(&priv->stats_mode, mode_conf->mode);
+			/* Atomically update mode with release semantics (never free stats_percpu) */
+			atomic_thread_fence_rel();
+			priv->stats_mode = mode_conf->mode;
 #else
 			error = EOPNOTSUPP;
 #endif
@@ -710,7 +741,8 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 
 			mode_conf = (struct ng_mss_rewrite_stats_mode *)resp->data;
 #if ENABLE_STATS
-			mode_conf->mode = atomic_load_acq_8(&priv->stats_mode);
+			mode_conf->mode = priv->stats_mode;
+			atomic_thread_fence_acq();
 #else
 			mode_conf->mode = STATS_MODE_DISABLED;
 #endif

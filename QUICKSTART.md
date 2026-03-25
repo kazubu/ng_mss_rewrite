@@ -73,10 +73,13 @@ ngctl msg em0_mss: getstats
 
 ## 6. Performance Tuning (Optional)
 
-For maximum performance in production, disable statistics at runtime:
+Statistics are disabled by default for maximum performance. To enable statistics at runtime:
 
 ```bash
-# Disable statistics (5-10% faster)
+# Enable per-CPU statistics (minimal overhead ~1-2%)
+ngctl msg em0_mss: setstatsmode "{ mode=1 }"
+
+# Disable statistics (default, maximum performance)
 ngctl msg em0_mss: setstatsmode "{ mode=0 }"
 
 # Check current mode
@@ -84,8 +87,8 @@ ngctl msg em0_mss: getstatsmode
 ```
 
 **Statistics modes:**
-- **0**: DISABLED (fastest, no overhead)
-- **1**: PERCPU (minimal overhead ~1-2%, default)
+- **0**: DISABLED (fastest, no overhead, default)
+- **1**: PERCPU (minimal overhead ~1-2%)
 
 **Note**: Switching modes does not reset counters. You can freely switch between modes without losing data.
 

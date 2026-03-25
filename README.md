@@ -13,8 +13,8 @@ FreeBSD netgraph node for rewriting TCP MSS (Maximum Segment Size) option in SYN
 - Automatically applies to all VLANs/bridges/tunnels
 - Validates packet headers and skips fragmented packets
 - **Two statistics modes for optimal performance:**
-  - **Disabled**: Zero overhead
-  - **Per-CPU**: Minimal overhead (~1-2%), default
+  - **Disabled**: Zero overhead (default)
+  - **Per-CPU**: Minimal overhead (~1-2%)
   - Runtime switchable without data loss
 
 ## Limitations
@@ -158,9 +158,8 @@ Args:   { mode=2 }
 ```
 
 Modes:
-- `0`: Disabled (no statistics collection)
-- `1`: Global (atomic counters, safe for all scenarios)
-- `2`: Per-CPU (best performance, default)
+- `0`: Disabled (no statistics collection, default)
+- `1`: Per-CPU (minimal overhead, best performance when statistics are needed)
 
 #### Statistics Mode Control
 
@@ -183,8 +182,8 @@ ngctl msg mss0: setstatsmode "{ mode=1 }"
 ```
 
 **Performance Impact:**
-- **DISABLED (0)**: Zero overhead, ~5-10% faster
-- **PERCPU (1)**: Minimal overhead (~1-2%), default
+- **DISABLED (0)**: Zero overhead (default)
+- **PERCPU (1)**: Minimal overhead (~1-2%)
 
 **Important Notes:**
 - Switching modes does NOT reset counters (baseline method)
