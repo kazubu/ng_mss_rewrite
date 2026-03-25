@@ -660,17 +660,7 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 				break;
 			}
 
-			/* Lazy allocate per-CPU array if switching to PERCPU */
-			if (mode_conf->mode == STATS_MODE_PERCPU && priv->stats_percpu == NULL) {
-				priv->stats_percpu = malloc(sizeof(struct ng_mss_stats_percpu) * mp_ncpus,
-				    M_NETGRAPH, M_NOWAIT | M_ZERO);
-				if (priv->stats_percpu == NULL) {
-					error = ENOMEM;
-					break;
-				}
-			}
-
-			/* Update mode (plain store, no fence needed since stats_percpu never freed) */
+			/* Update mode (stats_percpu already allocated at init, never freed) */
 			priv->stats_mode = mode_conf->mode;
 #else
 			error = EOPNOTSUPP;
