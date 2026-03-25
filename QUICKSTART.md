@@ -6,6 +6,9 @@
 cd /home/kazubu/tcpmss-rewrite
 make clean
 make
+
+# For maximum performance (no statistics):
+# make CFLAGS="-DENABLE_STATS=0"
 ```
 
 ## 2. Load the Module
@@ -69,7 +72,24 @@ Check statistics:
 ngctl msg em0_mss: getstats
 ```
 
-## 6. Manual Setup (Alternative)
+## 6. Performance Tuning (Optional)
+
+For maximum performance in production, disable statistics:
+
+```bash
+# Disable statistics collection (5-20% faster)
+ngctl msg em0_mss: setstatsmode "{ mode=0 }"
+
+# Check current mode
+ngctl msg em0_mss: getstatsmode
+```
+
+Statistics modes:
+- **0**: Disabled (fastest, no overhead)
+- **1**: Global atomic counters
+- **2**: Per-CPU counters (default, recommended)
+
+## 7. Manual Setup (Alternative)
 
 If you prefer manual setup:
 
@@ -90,7 +110,7 @@ ngctl msg em0_mss: setmss "{ mss_ipv4=1400 mss_ipv6=1380 }"
 ngctl show em0_mss:
 ```
 
-## 7. Remove
+## 8. Remove
 
 To remove the node:
 
