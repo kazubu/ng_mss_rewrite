@@ -24,8 +24,8 @@ fi
 # Load module if not already loaded
 if ! kldstat | grep -q ng_mss_rewrite; then
     echo "Loading ng_mss_rewrite module..."
-    if [ -f ../ng_mss_rewrite.ko ]; then
-        kldload ../ng_mss_rewrite.ko
+    if [ -f ./ng_mss_rewrite.ko ]; then
+        kldload ./ng_mss_rewrite.ko
     else
         kldload ng_mss_rewrite
     fi
@@ -35,6 +35,18 @@ if ! kldstat | grep -q ng_mss_rewrite; then
         exit 1
     fi
 fi
+
+# Load ng_ether module if not already loaded
+if ! kldstat | grep -q ng_ether; then
+    echo "Loading ng_ether module..."
+    kldload ng_ether
+
+    if [ $? -ne 0 ]; then
+        echo "Failed to load module"
+        exit 1
+    fi
+fi
+
 
 # Check if node already exists
 if ngctl list | grep -q "$NODE_NAME"; then
