@@ -255,9 +255,8 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m, int *rewritten)
 	*rewritten = 0;
 
 #if ENABLE_STATS
-	/* Snapshot stats mode with acquire semantics (avoid mid-packet mode changes) */
+	/* Snapshot stats mode (plain load, no fence needed since stats_percpu never freed) */
 	stats_mode = priv->stats_mode;
-	atomic_thread_fence_acq();
 #endif
 
 	/* Fast path: ensure minimum packet length */
@@ -671,8 +670,7 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 				}
 			}
 
-			/* Atomically update mode with release semantics (never free stats_percpu) */
-			atomic_thread_fence_rel();
+			/* Update mode (plain store, no fence needed since stats_percpu never freed) */
 			priv->stats_mode = mode_conf->mode;
 #else
 			error = EOPNOTSUPP;
@@ -693,7 +691,6 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 			mode_conf = (struct ng_mss_rewrite_stats_mode *)resp->data;
 #if ENABLE_STATS
 			mode_conf->mode = priv->stats_mode;
-			atomic_thread_fence_acq();
 #else
 			mode_conf->mode = STATS_MODE_DISABLED;
 #endif
