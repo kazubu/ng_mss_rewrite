@@ -4,11 +4,21 @@
 *.ko.debug
 *.ko.symbols
 .depend
+.depend.*
 export_syms
 machine
 x86
+i386
+opt_global.h
 .*.swp
 *~
+
+# Test build artifacts
+test/ng_builder
+test/ng_builder.debug
+test/ng_builder.full
+test/ng_builder.pieo
+test/ng_builder_mbuf
 
 # Test outputs
 *.pcap
