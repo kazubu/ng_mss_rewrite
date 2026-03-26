@@ -56,10 +56,35 @@
 #define ENABLE_STATS		1
 #endif
 
+/* Compile-time debug statistics (set to 1 for detailed path tracking) */
+#ifndef ENABLE_DEBUG_STATS
+#define ENABLE_DEBUG_STATS	0
+#endif
+
 /* Per-CPU statistics structure */
 struct ng_mss_stats_percpu {
 	uint64_t	packets_processed;
 	uint64_t	packets_rewritten;
+#if ENABLE_DEBUG_STATS
+	/* Code path tracking */
+	uint64_t	fast_path_count;
+	uint64_t	safe_path_count;
+	uint64_t	pullup_count;
+	uint64_t	pullup_failed;
+	uint64_t	unshare_count;
+	uint64_t	unshare_failed;
+	/* Skip reasons */
+	uint64_t	skip_offload;
+	uint64_t	skip_not_writable;
+	/* Early returns */
+	uint64_t	skip_too_short;
+	uint64_t	skip_not_ip;
+	uint64_t	skip_not_tcp;
+	uint64_t	skip_fragmented;
+	uint64_t	skip_no_syn;
+	uint64_t	skip_no_mss;
+	uint64_t	skip_mss_ok;
+#endif
 } __aligned(CACHE_LINE_SIZE);
 
 /* Private node data */
@@ -78,6 +103,23 @@ struct ng_mss_rewrite_private {
 	/* Baseline for resetstats (snapshot at last reset) */
 	uint64_t	baseline_processed;
 	uint64_t	baseline_rewritten;
+#if ENABLE_DEBUG_STATS
+	uint64_t	baseline_fast_path_count;
+	uint64_t	baseline_safe_path_count;
+	uint64_t	baseline_pullup_count;
+	uint64_t	baseline_pullup_failed;
+	uint64_t	baseline_unshare_count;
+	uint64_t	baseline_unshare_failed;
+	uint64_t	baseline_skip_offload;
+	uint64_t	baseline_skip_not_writable;
+	uint64_t	baseline_skip_too_short;
+	uint64_t	baseline_skip_not_ip;
+	uint64_t	baseline_skip_not_tcp;
+	uint64_t	baseline_skip_fragmented;
+	uint64_t	baseline_skip_no_syn;
+	uint64_t	baseline_skip_no_mss;
+	uint64_t	baseline_skip_mss_ok;
+#endif
 
 	/* Mutex for getstats/resetstats mutual exclusion */
 	struct mtx	stats_mtx;
@@ -105,6 +147,26 @@ struct ng_mss_rewrite_conf {
 struct ng_mss_rewrite_stats {
 	uint64_t	packets_processed;
 	uint64_t	packets_rewritten;
+#if ENABLE_DEBUG_STATS
+	/* Code path tracking */
+	uint64_t	fast_path_count;
+	uint64_t	safe_path_count;
+	uint64_t	pullup_count;
+	uint64_t	pullup_failed;
+	uint64_t	unshare_count;
+	uint64_t	unshare_failed;
+	/* Skip reasons */
+	uint64_t	skip_offload;
+	uint64_t	skip_not_writable;
+	/* Early returns */
+	uint64_t	skip_too_short;
+	uint64_t	skip_not_ip;
+	uint64_t	skip_not_tcp;
+	uint64_t	skip_fragmented;
+	uint64_t	skip_no_syn;
+	uint64_t	skip_no_mss;
+	uint64_t	skip_mss_ok;
+#endif
 };
 
 struct ng_mss_rewrite_stats_mode {
@@ -131,6 +193,23 @@ static const struct ng_parse_type ng_mss_rewrite_conf_type = {
 static const struct ng_parse_struct_field ng_mss_rewrite_stats_fields[] = {
 	{ "packets_processed",	&ng_parse_uint64_type },
 	{ "packets_rewritten",	&ng_parse_uint64_type },
+#if ENABLE_DEBUG_STATS
+	{ "fast_path_count",	&ng_parse_uint64_type },
+	{ "safe_path_count",	&ng_parse_uint64_type },
+	{ "pullup_count",	&ng_parse_uint64_type },
+	{ "pullup_failed",	&ng_parse_uint64_type },
+	{ "unshare_count",	&ng_parse_uint64_type },
+	{ "unshare_failed",	&ng_parse_uint64_type },
+	{ "skip_offload",	&ng_parse_uint64_type },
+	{ "skip_not_writable",	&ng_parse_uint64_type },
+	{ "skip_too_short",	&ng_parse_uint64_type },
+	{ "skip_not_ip",	&ng_parse_uint64_type },
+	{ "skip_not_tcp",	&ng_parse_uint64_type },
+	{ "skip_fragmented",	&ng_parse_uint64_type },
+	{ "skip_no_syn",	&ng_parse_uint64_type },
+	{ "skip_no_mss",	&ng_parse_uint64_type },
+	{ "skip_mss_ok",	&ng_parse_uint64_type },
+#endif
 	{ NULL }
 };
 static const struct ng_parse_type ng_mss_rewrite_stats_type = {
@@ -296,9 +375,23 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m, int from_upper)
 	 */
 	if (m->m_len >= 66) {
 		/* Fast path: contiguous mbuf, use direct pointer access */
+#if ENABLE_DEBUG_STATS
+		{
+			uint8_t stats_mode = atomic_load_acq_8(&priv->stats_mode);
+			if (stats_mode == STATS_MODE_PERCPU)
+				priv->stats_percpu[curcpu].fast_path_count++;
+		}
+#endif
 		return ng_mss_rewrite_process_fast(priv, m, from_upper);
 	} else {
 		/* Safe path: potentially fragmented, use m_copydata() */
+#if ENABLE_DEBUG_STATS
+		{
+			uint8_t stats_mode = atomic_load_acq_8(&priv->stats_mode);
+			if (stats_mode == STATS_MODE_PERCPU)
+				priv->stats_percpu[curcpu].safe_path_count++;
+		}
+#endif
 		return ng_mss_rewrite_process_safe(priv, m, from_upper);
 	}
 }
@@ -471,22 +564,46 @@ ng_mss_rewrite_process_fast(priv_p priv, struct mbuf *m, int from_upper)
 		}
 	}
 
-	if (mss_offset < 0)
+	if (mss_offset < 0) {
+#if ENABLE_DEBUG_STATS
+		if (st != NULL)
+			st->skip_no_mss++;
+#endif
 		return (m);
+	}
 
 	old_mss = (options[mss_offset + 2] << 8) | options[mss_offset + 3];
-	if (old_mss <= max_mss)
+	if (old_mss <= max_mss) {
+#if ENABLE_DEBUG_STATS
+		if (st != NULL)
+			st->skip_mss_ok++;
+#endif
 		return (m);
+	}
 
 	/* Checksum offload check for upper direction */
-	if (from_upper && (m->m_pkthdr.csum_flags & (CSUM_TCP | CSUM_TSO)))
+	if (from_upper && (m->m_pkthdr.csum_flags & (CSUM_TCP | CSUM_TSO))) {
+#if ENABLE_DEBUG_STATS
+		if (st != NULL)
+			st->skip_offload++;
+#endif
 		return (m);
+	}
 
 	/* Ensure writable */
 	if (M_WRITABLE(m) == 0) {
+#if ENABLE_DEBUG_STATS
+		if (st != NULL)
+			st->unshare_count++;
+#endif
 		m = m_unshare(m, M_NOWAIT);
-		if (m == NULL)
+		if (m == NULL) {
+#if ENABLE_DEBUG_STATS
+			if (st != NULL)
+				st->unshare_failed++;
+#endif
 			return (NULL);
+		}
 		/* Recalculate pointers */
 		pkt = mtod(m, uint8_t *);
 		tcp = (struct tcphdr *)(pkt + offset);
@@ -722,6 +839,10 @@ ng_mss_rewrite_process_safe(priv_p priv, struct mbuf *m, int from_upper)
 	}
 
 	/* MSS option not found */
+#if ENABLE_DEBUG_STATS
+	if (st != NULL)
+		st->skip_no_mss++;
+#endif
 	return (m);
 
 found_mss:
@@ -731,6 +852,10 @@ found_mss:
 	/* Check if rewrite is needed */
 	if (old_mss <= max_mss) {
 		/* MSS is already within limit, no rewrite needed */
+#if ENABLE_DEBUG_STATS
+		if (st != NULL)
+			st->skip_mss_ok++;
+#endif
 		return (m);
 	}
 
@@ -742,6 +867,10 @@ found_mss:
 	if (from_upper) {
 		if (m->m_pkthdr.csum_flags & (CSUM_TCP | CSUM_TSO)) {
 			/* Checksum offload active, skip rewrite */
+#if ENABLE_DEBUG_STATS
+			if (st != NULL)
+				st->skip_offload++;
+#endif
 			return (m);
 		}
 	}
@@ -753,16 +882,34 @@ found_mss:
 
 	/* Ensure we have contiguous access to headers we need to modify */
 	if (m->m_len < offset + tcp_hlen) {
+#if ENABLE_DEBUG_STATS
+		if (st != NULL)
+			st->pullup_count++;
+#endif
 		m = m_pullup(m, offset + tcp_hlen);
-		if (m == NULL)
+		if (m == NULL) {
+#if ENABLE_DEBUG_STATS
+			if (st != NULL)
+				st->pullup_failed++;
+#endif
 			return (NULL);
+		}
 	}
 
 	/* Ensure mbuf is writable (not shared) */
 	if (M_WRITABLE(m) == 0) {
+#if ENABLE_DEBUG_STATS
+		if (st != NULL)
+			st->unshare_count++;
+#endif
 		m = m_unshare(m, M_NOWAIT);
-		if (m == NULL)
+		if (m == NULL) {
+#if ENABLE_DEBUG_STATS
+			if (st != NULL)
+				st->unshare_failed++;
+#endif
 			return (NULL);
+		}
 	}
 
 	/* Get pointers to actual packet data for modification */
@@ -946,18 +1093,69 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 			/* Aggregate per-CPU counters */
 			stats->packets_processed = 0;
 			stats->packets_rewritten = 0;
+#if ENABLE_DEBUG_STATS
+			stats->fast_path_count = 0;
+			stats->safe_path_count = 0;
+			stats->pullup_count = 0;
+			stats->pullup_failed = 0;
+			stats->unshare_count = 0;
+			stats->unshare_failed = 0;
+			stats->skip_offload = 0;
+			stats->skip_not_writable = 0;
+			stats->skip_too_short = 0;
+			stats->skip_not_ip = 0;
+			stats->skip_not_tcp = 0;
+			stats->skip_fragmented = 0;
+			stats->skip_no_syn = 0;
+			stats->skip_no_mss = 0;
+			stats->skip_mss_ok = 0;
+#endif
 
 			if (priv->stats_percpu != NULL) {
 				int cpu;
 				for (cpu = 0; cpu < mp_ncpus; cpu++) {
 					stats->packets_processed += priv->stats_percpu[cpu].packets_processed;
 					stats->packets_rewritten += priv->stats_percpu[cpu].packets_rewritten;
+#if ENABLE_DEBUG_STATS
+					stats->fast_path_count += priv->stats_percpu[cpu].fast_path_count;
+					stats->safe_path_count += priv->stats_percpu[cpu].safe_path_count;
+					stats->pullup_count += priv->stats_percpu[cpu].pullup_count;
+					stats->pullup_failed += priv->stats_percpu[cpu].pullup_failed;
+					stats->unshare_count += priv->stats_percpu[cpu].unshare_count;
+					stats->unshare_failed += priv->stats_percpu[cpu].unshare_failed;
+					stats->skip_offload += priv->stats_percpu[cpu].skip_offload;
+					stats->skip_not_writable += priv->stats_percpu[cpu].skip_not_writable;
+					stats->skip_too_short += priv->stats_percpu[cpu].skip_too_short;
+					stats->skip_not_ip += priv->stats_percpu[cpu].skip_not_ip;
+					stats->skip_not_tcp += priv->stats_percpu[cpu].skip_not_tcp;
+					stats->skip_fragmented += priv->stats_percpu[cpu].skip_fragmented;
+					stats->skip_no_syn += priv->stats_percpu[cpu].skip_no_syn;
+					stats->skip_no_mss += priv->stats_percpu[cpu].skip_no_mss;
+					stats->skip_mss_ok += priv->stats_percpu[cpu].skip_mss_ok;
+#endif
 				}
 			}
 
 			/* Subtract baseline (for resetstats support) */
 			stats->packets_processed -= priv->baseline_processed;
 			stats->packets_rewritten -= priv->baseline_rewritten;
+#if ENABLE_DEBUG_STATS
+			stats->fast_path_count -= priv->baseline_fast_path_count;
+			stats->safe_path_count -= priv->baseline_safe_path_count;
+			stats->pullup_count -= priv->baseline_pullup_count;
+			stats->pullup_failed -= priv->baseline_pullup_failed;
+			stats->unshare_count -= priv->baseline_unshare_count;
+			stats->unshare_failed -= priv->baseline_unshare_failed;
+			stats->skip_offload -= priv->baseline_skip_offload;
+			stats->skip_not_writable -= priv->baseline_skip_not_writable;
+			stats->skip_too_short -= priv->baseline_skip_too_short;
+			stats->skip_not_ip -= priv->baseline_skip_not_ip;
+			stats->skip_not_tcp -= priv->baseline_skip_not_tcp;
+			stats->skip_fragmented -= priv->baseline_skip_fragmented;
+			stats->skip_no_syn -= priv->baseline_skip_no_syn;
+			stats->skip_no_mss -= priv->baseline_skip_no_mss;
+			stats->skip_mss_ok -= priv->baseline_skip_mss_ok;
+#endif
 
 			mtx_unlock(&priv->stats_mtx);
 #else
@@ -972,6 +1170,15 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 		{
 			/* Baseline method: snapshot current total, don't zero live counters */
 			uint64_t total_processed = 0, total_rewritten = 0;
+#if ENABLE_DEBUG_STATS
+			uint64_t total_fast_path = 0, total_safe_path = 0;
+			uint64_t total_pullup = 0, total_pullup_failed = 0;
+			uint64_t total_unshare = 0, total_unshare_failed = 0;
+			uint64_t total_skip_offload = 0, total_skip_not_writable = 0;
+			uint64_t total_skip_too_short = 0, total_skip_not_ip = 0;
+			uint64_t total_skip_not_tcp = 0, total_skip_fragmented = 0;
+			uint64_t total_skip_no_syn = 0, total_skip_no_mss = 0, total_skip_mss_ok = 0;
+#endif
 
 			/* Lock to prevent race with getstats */
 			mtx_lock(&priv->stats_mtx);
@@ -981,11 +1188,45 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 				for (cpu = 0; cpu < mp_ncpus; cpu++) {
 					total_processed += priv->stats_percpu[cpu].packets_processed;
 					total_rewritten += priv->stats_percpu[cpu].packets_rewritten;
+#if ENABLE_DEBUG_STATS
+					total_fast_path += priv->stats_percpu[cpu].fast_path_count;
+					total_safe_path += priv->stats_percpu[cpu].safe_path_count;
+					total_pullup += priv->stats_percpu[cpu].pullup_count;
+					total_pullup_failed += priv->stats_percpu[cpu].pullup_failed;
+					total_unshare += priv->stats_percpu[cpu].unshare_count;
+					total_unshare_failed += priv->stats_percpu[cpu].unshare_failed;
+					total_skip_offload += priv->stats_percpu[cpu].skip_offload;
+					total_skip_not_writable += priv->stats_percpu[cpu].skip_not_writable;
+					total_skip_too_short += priv->stats_percpu[cpu].skip_too_short;
+					total_skip_not_ip += priv->stats_percpu[cpu].skip_not_ip;
+					total_skip_not_tcp += priv->stats_percpu[cpu].skip_not_tcp;
+					total_skip_fragmented += priv->stats_percpu[cpu].skip_fragmented;
+					total_skip_no_syn += priv->stats_percpu[cpu].skip_no_syn;
+					total_skip_no_mss += priv->stats_percpu[cpu].skip_no_mss;
+					total_skip_mss_ok += priv->stats_percpu[cpu].skip_mss_ok;
+#endif
 				}
 			}
 
 			priv->baseline_processed = total_processed;
 			priv->baseline_rewritten = total_rewritten;
+#if ENABLE_DEBUG_STATS
+			priv->baseline_fast_path_count = total_fast_path;
+			priv->baseline_safe_path_count = total_safe_path;
+			priv->baseline_pullup_count = total_pullup;
+			priv->baseline_pullup_failed = total_pullup_failed;
+			priv->baseline_unshare_count = total_unshare;
+			priv->baseline_unshare_failed = total_unshare_failed;
+			priv->baseline_skip_offload = total_skip_offload;
+			priv->baseline_skip_not_writable = total_skip_not_writable;
+			priv->baseline_skip_too_short = total_skip_too_short;
+			priv->baseline_skip_not_ip = total_skip_not_ip;
+			priv->baseline_skip_not_tcp = total_skip_not_tcp;
+			priv->baseline_skip_fragmented = total_skip_fragmented;
+			priv->baseline_skip_no_syn = total_skip_no_syn;
+			priv->baseline_skip_no_mss = total_skip_no_mss;
+			priv->baseline_skip_mss_ok = total_skip_mss_ok;
+#endif
 
 			mtx_unlock(&priv->stats_mtx);
 		}

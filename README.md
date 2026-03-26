@@ -65,6 +65,10 @@ sudo make install
 
 - `ENABLE_STATS=1` (default): Enable statistics support
 - `ENABLE_STATS=0`: Disable all statistics at compile time (5-20% faster)
+- `DEBUG_STATS=1`: Enable detailed debug statistics (code path tracking, mbuf operations, skip reasons)
+  - **Only for development/testing**: Adds ~15 additional counters
+  - Use this to verify which code paths are exercised during testing
+  - Example: `make DEBUG_STATS=1`
 
 ## Loading
 
@@ -151,6 +155,48 @@ Args:   { packets_processed=12345 packets_rewritten=678 }
 ```bash
 ngctl msg mss0: resetstats
 ```
+
+### Debug Statistics (Development/Testing)
+
+When the module is built with `DEBUG_STATS=1`, additional counters are available to track internal code paths and operations. This is useful for:
+- Verifying test coverage
+- Understanding which code paths are exercised
+- Debugging performance issues
+- Validating mbuf handling correctness
+
+**Example output with debug statistics:**
+```
+Rec'd response "getstats" (4) from "mss0:":
+Args:   { packets_processed=100 packets_rewritten=50
+          fast_path_count=90 safe_path_count=10
+          pullup_count=5 unshare_count=3
+          skip_mss_ok=50 skip_offload=0 }
+```
+
+**Debug statistics fields:**
+
+**Code Path Tracking:**
+- `fast_path_count`: Packets processed via fast path (contiguous mbuf, m_len >= 66)
+- `safe_path_count`: Packets processed via safe path (fragmented mbuf chain)
+
+**Mbuf Operations:**
+- `pullup_count`: Number of times `m_pullup()` was called to make headers contiguous
+- `pullup_failed`: Number of times `m_pullup()` failed (packet dropped)
+- `unshare_count`: Number of times `m_unshare()` was called to make mbuf writable
+- `unshare_failed`: Number of times `m_unshare()` failed (packet dropped)
+
+**Skip Reasons (packet processed but not rewritten):**
+- `skip_offload`: Skipped due to checksum offload active (upper direction)
+- `skip_mss_ok`: MSS already within limit (no rewrite needed)
+- `skip_no_mss`: No MSS option found in TCP options
+- `skip_not_writable`: Mbuf not writable (should not occur with current code)
+- `skip_too_short`: Packet too short to contain TCP header
+- `skip_not_ip`: Not an IP packet
+- `skip_not_tcp`: Not a TCP packet
+- `skip_fragmented`: IP fragment (not first fragment)
+- `skip_no_syn`: Not a SYN packet
+
+**Note:** Debug statistics have minimal performance overhead but add ~15 counters. Only use for development/testing, not in production.
 
 ### Statistics Mode Control
 

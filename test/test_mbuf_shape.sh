@@ -359,6 +359,14 @@ printf "${RED}Failed: %d${NC}\n" "$TESTS_FAILED"
 printf "${YELLOW}Skipped: %d${NC}\n" "$((TESTS_TOTAL - TESTS_PASSED - TESTS_FAILED))"
 echo ""
 
+# Show final statistics (including debug stats if enabled)
+echo "=========================================="
+echo "  Final Statistics"
+echo "=========================================="
+echo ""
+ngctl msg mbuf_test_mss: getstats 2>&1 || echo "Failed to get statistics"
+echo ""
+
 if [ "$TESTS_FAILED" -gt 0 ]; then
 	echo "Result: FAIL"
 	exit 1
