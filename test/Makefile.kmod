@@ -1,0 +1,9 @@
+# Makefile for ng_mbuf_inject kernel module
+
+KMOD=	ng_mbuf_inject
+SRCS=	ng_mbuf_inject.c
+
+# Enable debugging
+# CFLAGS+= -DDEBUG
+
+.include <bsd.kmod.mk>

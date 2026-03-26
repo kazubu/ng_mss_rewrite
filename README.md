@@ -372,6 +372,83 @@ Actual performance depends on:
 - Kernel configuration
 - System load
 
+## Mbuf Shape Testing
+
+Advanced tests for verifying correct handling of various mbuf memory structures. These tests validate the core safety improvements in the module:
+
+```bash
+cd test
+sudo ./test_mbuf_shape.sh
+```
+
+This test suite validates:
+
+### 1. Fragmented Mbuf Chains (Critical)
+Tests packets where headers span multiple mbuf buffers:
+- Tests the safe path using `m_copydata()` for header parsing
+- Validates that `m->m_len < 66` but `m_pkthdr.len >= full_packet_length` is handled correctly
+- Different split points (at Ethernet boundary, mid-header, etc.)
+- Both IPv4 and IPv6 fragmented packets
+
+**Why this matters**: Without proper `m_copydata()` usage, the module would crash when accessing headers that span multiple mbufs.
+
+### 2. Shared Mbufs (M_WRITABLE == 0)
+Tests read-only mbufs that require unsharing before modification:
+- Creates mbufs with `M_EXT_WRITABLE(m) == 0`
+- Validates `m_unshare()` code path when MSS rewrite is needed
+- Ensures no memory corruption or leaks
+
+**Why this matters**: Modifying a shared mbuf would corrupt packet data for other consumers.
+
+### 3. Checksum Offload Flags
+Tests packets with TSO/checksum offload metadata:
+- Upper direction packets with `CSUM_TCP` or `CSUM_TSO` flags set
+- Validates that these packets are skipped (checksum is incomplete)
+- Prevents corrupting hardware-offloaded checksums
+
+**Why this matters**: Hardware offload means `th_sum` contains a partial checksum or seed value, not the complete checksum. Modifying MSS without recalculating from scratch would produce invalid checksums.
+
+### 4. IPv6 Extension Headers
+Tests IPv6 packets with extension headers (current limitation):
+- Hop-by-Hop Options header
+- Routing header
+- Fragment header
+- Validates that these are correctly skipped (not yet supported)
+
+**Why this matters**: Documents current limitation and provides regression tests for future extension header support.
+
+### Expected Output
+
+All tests should PASS except:
+- "Upper hook + offload flags" - Skipped (requires complex topology)
+- "Fragmented + Shared mbuf" - Skipped (complex edge case)
+
+Example:
+```
+==========================================
+  Mbuf Shape Testing for ng_mss_rewrite
+==========================================
+
+[PASS] Single contiguous mbuf, IPv4, MSS rewrite
+[PASS] Fragmented mbuf chain (split at Ether), IPv4, MSS rewrite
+[PASS] Fragmented mbuf chain (split at byte 10), IPv4, MSS rewrite
+[PASS] Fragmented mbuf chain, IPv6, MSS rewrite
+[PASS] Shared mbuf (M_WRITABLE==0), IPv4, MSS rewrite
+[SKIP] Upper hook + offload flags (requires topology reconfiguration)
+[PASS] IPv6 + Hop-by-Hop ext header: correctly skipped
+[PASS] IPv6 + Routing ext header: correctly skipped
+[PASS] IPv6 + Fragment ext header: correctly skipped
+[PASS] Fragmented mbuf, MSS=1200 (<= 1400): processed but not rewritten
+[SKIP] Fragmented + Shared mbuf (complex case)
+
+Total tests: 11
+Passed: 9
+Failed: 0
+Skipped: 2
+
+Result: PASS
+```
+
 ## Troubleshooting
 
 ### Module fails to load
