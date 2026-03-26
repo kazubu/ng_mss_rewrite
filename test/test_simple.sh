@@ -14,15 +14,45 @@ ngctl shutdown mss_bench_mss: 2>/dev/null
 ngctl shutdown mss_bench_hole: 2>/dev/null
 sleep 1
 
-# Reload module
+# Force reload module to test latest binary
+echo "Reloading ng_mss_rewrite module..."
 if kldstat | grep -q ng_mss_rewrite; then
     echo "Unloading existing ng_mss_rewrite module..."
-    kldunload ng_mss_rewrite 2>/dev/null || true
+    kldunload ng_mss_rewrite || {
+        echo "ERROR: Failed to unload ng_mss_rewrite (may be in use)"
+        exit 1
+    }
     sleep 1
 fi
 
 echo "Loading ng_mss_rewrite module..."
-kldload ./ng_mss_rewrite.ko 2>/dev/null || kldload ng_mss_rewrite || exit 1
+if [ -f "../ng_mss_rewrite.ko" ]; then
+    echo "Loading local module: ../ng_mss_rewrite.ko"
+    kldload ../ng_mss_rewrite.ko || {
+        echo "ERROR: Failed to load ng_mss_rewrite.ko"
+        exit 1
+    }
+elif [ -f "./ng_mss_rewrite.ko" ]; then
+    echo "Loading local module: ./ng_mss_rewrite.ko"
+    kldload ./ng_mss_rewrite.ko || {
+        echo "ERROR: Failed to load ng_mss_rewrite.ko"
+        exit 1
+    }
+else
+    echo "Loading system module: ng_mss_rewrite"
+    kldload ng_mss_rewrite || {
+        echo "ERROR: Failed to load ng_mss_rewrite"
+        exit 1
+    }
+fi
+
+# Verify module is loaded
+if ! kldstat | grep -q ng_mss_rewrite; then
+    echo "ERROR: ng_mss_rewrite not loaded after kldload"
+    exit 1
+fi
+
+echo "Module loaded successfully"
 
 echo "Starting ng_builder..."
 ./test/ng_builder &

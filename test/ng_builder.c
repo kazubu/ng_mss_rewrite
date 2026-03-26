@@ -21,6 +21,10 @@ main(int argc, char *argv[])
 	struct ngm_mkpeer mkp;
 	struct ngm_name nm;
 	char path[NG_PATHSIZ];
+	const char *node_prefix;
+
+	/* Allow node name prefix to be specified */
+	node_prefix = (argc > 1) ? argv[1] : "mss_bench";
 
 	/* Create control socket */
 	if (NgMkSockNode(NULL, &cs, &ds) < 0)
@@ -39,29 +43,31 @@ main(int argc, char *argv[])
 		err(1, "mkpeer mss_rewrite");
 
 	/* Name the mss_rewrite node */
-	snprintf(nm.name, sizeof(nm.name), "mss_bench_mss");
+	snprintf(nm.name, sizeof(nm.name), "%s_mss", node_prefix);
 	if (NgSendMsg(cs, ".:hook1", NGM_GENERIC_COOKIE, NGM_NAME,
 	    &nm, sizeof(nm)) < 0)
 		err(1, "name mss_rewrite");
 
-	printf("Created mss_rewrite node: mss_bench_mss\n");
+	printf("Created mss_rewrite node: %s_mss\n", node_prefix);
 
 	/* Create source on mss_rewrite's lower hook */
 	snprintf(mkp.type, sizeof(mkp.type), "source");
 	snprintf(mkp.ourhook, sizeof(mkp.ourhook), "lower");
 	snprintf(mkp.peerhook, sizeof(mkp.peerhook), "output");
 
-	if (NgSendMsg(cs, "mss_bench_mss:", NGM_GENERIC_COOKIE, NGM_MKPEER,
+	snprintf(path, sizeof(path), "%s_mss:", node_prefix);
+	if (NgSendMsg(cs, path, NGM_GENERIC_COOKIE, NGM_MKPEER,
 	    &mkp, sizeof(mkp)) < 0)
 		err(1, "mkpeer source");
 
 	/* Name the source node */
-	snprintf(nm.name, sizeof(nm.name), "mss_bench_source");
-	if (NgSendMsg(cs, "mss_bench_mss:lower", NGM_GENERIC_COOKIE, NGM_NAME,
+	snprintf(nm.name, sizeof(nm.name), "%s_source", node_prefix);
+	snprintf(path, sizeof(path), "%s_mss:lower", node_prefix);
+	if (NgSendMsg(cs, path, NGM_GENERIC_COOKIE, NGM_NAME,
 	    &nm, sizeof(nm)) < 0)
 		err(1, "name source");
 
-	printf("Created source node: mss_bench_source\n");
+	printf("Created source node: %s_source\n", node_prefix);
 
 	/* Create hole on mss_rewrite's upper hook (already used by socket, need to disconnect) */
 	/* Actually, the socket is on upper, so we need to create hole differently */
@@ -81,19 +87,19 @@ main(int argc, char *argv[])
 	snprintf(mkp.ourhook, sizeof(mkp.ourhook), "upper");
 	snprintf(mkp.peerhook, sizeof(mkp.peerhook), "data");
 
-	if (NgSendMsg(cs, "mss_bench_mss:", NGM_GENERIC_COOKIE, NGM_MKPEER,
+	snprintf(path, sizeof(path), "%s_mss:", node_prefix);
+	if (NgSendMsg(cs, path, NGM_GENERIC_COOKIE, NGM_MKPEER,
 	    &mkp, sizeof(mkp)) < 0)
 		err(1, "mkpeer hole");
 
 	/* Name the hole node */
-	snprintf(nm.name, sizeof(nm.name), "mss_bench_hole");
-	if (NgSendMsg(cs, "mss_bench_mss:upper", NGM_GENERIC_COOKIE, NGM_NAME,
+	snprintf(nm.name, sizeof(nm.name), "%s_hole", node_prefix);
+	snprintf(path, sizeof(path), "%s_mss:upper", node_prefix);
+	if (NgSendMsg(cs, path, NGM_GENERIC_COOKIE, NGM_NAME,
 	    &nm, sizeof(nm)) < 0)
 		err(1, "name hole");
 
-	printf("Created hole node: mss_bench_hole\n");
-
-	printf("Created hole node: mss_bench_hole\n");
+	printf("Created hole node: %s_hole\n", node_prefix);
 
 	printf("\nTopology created successfully!\n");
 	printf("Keeping socket alive (press Ctrl+C to destroy)...\n");
