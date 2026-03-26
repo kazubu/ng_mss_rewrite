@@ -292,8 +292,9 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m)
 	if (m->m_pkthdr.len < sizeof(struct ether_header) + sizeof(struct ip) + sizeof(struct tcphdr))
 		return (m);
 
-	/* Optimize: pull up headers in one go (most packets fit in single mbuf) */
-	pullup_len = min(m->m_pkthdr.len, MAX_HDR_LEN);
+	/* Stage 1: Pull up only Ethernet + VLAN + minimal IP header for fast path */
+	pullup_len = sizeof(struct ether_header) + ETHER_VLAN_ENCAP_LEN + sizeof(struct ip);
+	pullup_len = min(m->m_pkthdr.len, pullup_len);
 	if (m->m_len < pullup_len) {
 		m = m_pullup(m, pullup_len);
 		if (m == NULL)
@@ -410,12 +411,12 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m)
 		st->packets_processed++;
 #endif
 
-	/* If we didn't pull up enough, do it now (rare case) */
+	/* Stage 2: Pull up full TCP header with options (only for SYN packets) */
 	if (m->m_len < offset + tcp_hlen) {
 		m = m_pullup(m, offset + tcp_hlen);
 		if (m == NULL)
 			return (NULL);
-		/* Recalculate pointers */
+		/* Recalculate pointers after pullup */
 		pkt = mtod(m, uint8_t *);
 		if (ip4)
 			ip4 = (struct ip *)(pkt + offset - ip_hlen);
@@ -428,6 +429,28 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m)
 	options = (uint8_t *)(tcp + 1);
 	opt_len = tcp_hlen - sizeof(struct tcphdr);
 
+	/* Fast path: check common MSS option positions */
+	if (opt_len >= 4) {
+		/* Case 1: MSS at beginning (offset 0) */
+		if (options[0] == TCPOPT_MAXSEG && options[1] == 4) {
+			i = 0;
+			goto found_mss;
+		}
+		/* Case 2: NOP + MSS (offset 1) */
+		if (opt_len >= 5 && options[0] == TCPOPT_NOP &&
+		    options[1] == TCPOPT_MAXSEG && options[2] == 4) {
+			i = 1;
+			goto found_mss;
+		}
+		/* Case 3: NOP + NOP + MSS (offset 2) */
+		if (opt_len >= 6 && options[0] == TCPOPT_NOP &&
+		    options[1] == TCPOPT_NOP && options[2] == TCPOPT_MAXSEG && options[3] == 4) {
+			i = 2;
+			goto found_mss;
+		}
+	}
+
+	/* Slow path: walk options generically */
 	for (i = 0; i < opt_len; ) {
 		uint8_t opt_type = options[i];
 		uint8_t opt_size;
@@ -448,8 +471,10 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m)
 			break;
 
 		if (opt_type == TCPOPT_MAXSEG && opt_size == 4) {
+			uint16_t old_mss;
+found_mss:
 			/* Found MSS option */
-			uint16_t old_mss = (options[i + 2] << 8) | options[i + 3];
+			old_mss = (options[i + 2] << 8) | options[i + 3];
 
 			if (old_mss > max_mss) {
 				/* MSS rewrite needed - ensure mbuf is writable */
