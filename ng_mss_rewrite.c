@@ -248,7 +248,7 @@ NETGRAPH_INIT(mss_rewrite, &ng_mss_rewrite_typestruct);
  * Where HC is old checksum, m is old data, m' is new data
  * All parameters are in network byte order, returns network byte order
  */
-static uint16_t
+static __inline uint16_t
 tcp_checksum_adjust(uint16_t old_check, uint16_t old_data, uint16_t new_data)
 {
 	uint32_t sum;
@@ -270,7 +270,7 @@ tcp_checksum_adjust(uint16_t old_check, uint16_t old_data, uint16_t new_data)
 
 /* Process and possibly rewrite MSS in a packet - optimized version */
 static struct mbuf *
-ng_mss_rewrite_process(priv_p priv, struct mbuf *m, int *rewritten)
+ng_mss_rewrite_process(priv_p priv, struct mbuf *m)
 {
 	struct ether_header *eh;
 	struct ip *ip4 = NULL;
@@ -285,9 +285,8 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m, int *rewritten)
 	uint16_t plen;
 #if ENABLE_STATS
 	uint8_t stats_mode;  /* Snapshot stats mode once per packet */
+	struct ng_mss_stats_percpu *st = NULL;  /* Cached stats pointer */
 #endif
-
-	*rewritten = 0;
 
 	/* Fast path: ensure minimum packet length */
 	if (m->m_pkthdr.len < sizeof(struct ether_header) + sizeof(struct ip) + sizeof(struct tcphdr))
@@ -401,12 +400,14 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m, int *rewritten)
 		return (m);
 
 #if ENABLE_STATS
-	/* Snapshot stats mode (plain load, no fence needed since stats_percpu never freed) */
+	/* Snapshot stats mode and cache pointer (plain load, no fence needed since stats_percpu never freed) */
 	stats_mode = priv->stats_mode;
+	if (stats_mode == STATS_MODE_PERCPU)
+		st = &priv->stats_percpu[curcpu];
 
 	/* Increment SYN packets counter (if not disabled) */
-	if (stats_mode == STATS_MODE_PERCPU)
-		priv->stats_percpu[curcpu].packets_processed++;
+	if (st != NULL)
+		st->packets_processed++;
 #endif
 
 	/* If we didn't pull up enough, do it now (rare case) */
@@ -474,12 +475,10 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m, int *rewritten)
 				options[i + 2] = (max_mss >> 8) & 0xff;
 				options[i + 3] = max_mss & 0xff;
 
-				*rewritten = 1;
-
 #if ENABLE_STATS
 				/* Increment rewritten counter (if not disabled) */
-				if (stats_mode == STATS_MODE_PERCPU)
-					priv->stats_percpu[curcpu].packets_rewritten++;
+				if (st != NULL)
+					st->packets_rewritten++;
 #endif
 			}
 			break;
@@ -800,8 +799,7 @@ ng_mss_rewrite_rcvdata(hook_p hook, item_p item)
 		out_hook = priv->upper;
 		/* Check if lower->upper processing is enabled */
 		if (priv->enable_lower) {
-			int rewritten;
-			m = ng_mss_rewrite_process(priv, m, &rewritten);
+			m = ng_mss_rewrite_process(priv, m);
 			if (m == NULL) {
 				/* Packet was dropped during processing */
 				NG_FREE_ITEM(item);
@@ -812,8 +810,7 @@ ng_mss_rewrite_rcvdata(hook_p hook, item_p item)
 		out_hook = priv->lower;
 		/* Check if upper->lower processing is enabled */
 		if (priv->enable_upper) {
-			int rewritten;
-			m = ng_mss_rewrite_process(priv, m, &rewritten);
+			m = ng_mss_rewrite_process(priv, m);
 			if (m == NULL) {
 				/* Packet was dropped during processing */
 				NG_FREE_ITEM(item);
