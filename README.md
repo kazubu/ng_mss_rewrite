@@ -6,7 +6,7 @@ FreeBSD netgraph node for rewriting TCP MSS (Maximum Segment Size) option in SYN
 
 - Rewrites TCP MSS option in SYN packets
 - Supports IPv4 (all cases) and IPv6 (simple cases only, see limitations below)
-- Handles VLAN-tagged frames
+- Handles VLAN-tagged frames (single, TPID 0x8100 only)
 - Only rewrites if existing MSS > configured MSS (never increases MSS)
 - High performance (processes packets at line rate)
 - Works at L2 level on physical interface
@@ -154,7 +154,7 @@ ngctl msg mss0: getstatsmode
 Output:
 ```
 Rec'd response "getstatsmode" (6) from "mss0:":
-Args:   { mode=2 }
+Args:   { mode=1 }
 ```
 
 Modes:
@@ -330,7 +330,7 @@ BSD 2-Clause License
 
 ## Author
 
-Created for high-performance TCP MSS rewriting on FreeBSD with netgraph.
+Kazuki Shimizu
 
 ## References
 
