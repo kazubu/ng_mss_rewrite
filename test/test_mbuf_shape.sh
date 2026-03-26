@@ -31,6 +31,9 @@ TESTS_PASSED=0
 TESTS_FAILED=0
 TESTS_TOTAL=0
 
+# Check if debug statistics are enabled
+DEBUG_STATS_ENABLED=0
+
 # Cleanup function
 cleanup() {
 	echo ""
@@ -75,13 +78,15 @@ skip_test() {
 }
 
 # Helper function to run inject test and check results
-# Usage: run_inject_test "inject_command" "params" expected_processed expected_rewritten "test_name"
+# Usage: run_inject_test "inject_command" "params" expected_processed expected_rewritten "test_name" [debug_counter] [debug_expected]
 run_inject_test() {
 	local cmd=$1
 	local params=$2
 	local expected_proc=$3
 	local expected_rewr=$4
 	local test_name=$5
+	local debug_counter=$6
+	local debug_expected=$7
 
 	# Reset stats
 	ngctl msg mbuf_test_mss: resetstats >/dev/null 2>&1
@@ -120,11 +125,47 @@ run_inject_test() {
 	[ -z "$PROCESSED" ] && PROCESSED=0
 	[ -z "$REWRITTEN" ] && REWRITTEN=0
 
-	if [ "$PROCESSED" = "$expected_proc" ] && [ "$REWRITTEN" = "$expected_rewr" ]; then
-		pass_test "$test_name"
-	else
-		fail_test "$test_name: processed=$PROCESSED, rewritten=$REWRITTEN (expected $expected_proc, $expected_rewr)"
+	# Display raw statistics for this test
+	echo "  Stats: processed=$PROCESSED rewritten=$REWRITTEN"
+	if [ "$DEBUG_STATS_ENABLED" = "1" ]; then
+		# Extract and display debug counters
+		FAST_PATH=$(echo "$STATS" | grep -o 'fast_path_count=[0-9]*' | cut -d= -f2)
+		SAFE_PATH=$(echo "$STATS" | grep -o 'safe_path_count=[0-9]*' | cut -d= -f2)
+		PULLUP=$(echo "$STATS" | grep -o 'pullup_count=[0-9]*' | cut -d= -f2)
+		UNSHARE=$(echo "$STATS" | grep -o 'unshare_count=[0-9]*' | cut -d= -f2)
+		SKIP_OFFLOAD=$(echo "$STATS" | grep -o 'skip_offload=[0-9]*' | cut -d= -f2)
+		SKIP_MSS_OK=$(echo "$STATS" | grep -o 'skip_mss_ok=[0-9]*' | cut -d= -f2)
+		SKIP_NO_MSS=$(echo "$STATS" | grep -o 'skip_no_mss=[0-9]*' | cut -d= -f2)
+
+		[ -z "$FAST_PATH" ] && FAST_PATH=0
+		[ -z "$SAFE_PATH" ] && SAFE_PATH=0
+		[ -z "$PULLUP" ] && PULLUP=0
+		[ -z "$UNSHARE" ] && UNSHARE=0
+		[ -z "$SKIP_OFFLOAD" ] && SKIP_OFFLOAD=0
+		[ -z "$SKIP_MSS_OK" ] && SKIP_MSS_OK=0
+		[ -z "$SKIP_NO_MSS" ] && SKIP_NO_MSS=0
+
+		echo "  Debug: fast=$FAST_PATH safe=$SAFE_PATH pullup=$PULLUP unshare=$UNSHARE skip_offload=$SKIP_OFFLOAD skip_mss_ok=$SKIP_MSS_OK skip_no_mss=$SKIP_NO_MSS"
 	fi
+
+	# Check basic counters
+	if [ "$PROCESSED" != "$expected_proc" ] || [ "$REWRITTEN" != "$expected_rewr" ]; then
+		fail_test "$test_name: processed=$PROCESSED, rewritten=$REWRITTEN (expected $expected_proc, $expected_rewr)"
+		return 1
+	fi
+
+	# Check debug counter if specified and debug stats are enabled
+	if [ -n "$debug_counter" ] && [ "$DEBUG_STATS_ENABLED" = "1" ]; then
+		DEBUG_VALUE=$(echo "$STATS" | grep -o "${debug_counter}=[0-9]*" | cut -d= -f2)
+		[ -z "$DEBUG_VALUE" ] && DEBUG_VALUE=0
+
+		if [ "$DEBUG_VALUE" != "$debug_expected" ]; then
+			fail_test "$test_name: ${debug_counter}=$DEBUG_VALUE (expected $debug_expected)"
+			return 1
+		fi
+	fi
+
+	pass_test "$test_name"
 }
 
 echo "=========================================="
@@ -269,12 +310,27 @@ ngctl msg mbuf_test_mss: setstatsmode "{ mode=1 }"
 # Enable both directions for testing
 ngctl msg mbuf_test_mss: setdirection "{ enable_lower=1 enable_upper=1 }"
 
+# Check if debug statistics are enabled in the module
+# Run a dummy test to generate some stats, then check for debug fields
+ngctl msg mbuf_test_inject: inject_single "{ mss=1460 ipv6=0 split_offset=0 csum_flags=0 ext_type=0 }" >/dev/null 2>&1
+sleep 0.1
+STATS_CHECK=$(ngctl msg mbuf_test_mss: getstats 2>&1)
+ngctl msg mbuf_test_mss: resetstats >/dev/null 2>&1
+
+if echo "$STATS_CHECK" | grep -q "fast_path_count\|safe_path_count"; then
+	DEBUG_STATS_ENABLED=1
+	echo "Debug statistics: ENABLED"
+else
+	DEBUG_STATS_ENABLED=0
+	echo "Debug statistics: disabled"
+fi
+
 echo ""
 echo "=========================================="
 echo "  Test 1: Single Contiguous Mbuf (Baseline)"
 echo "=========================================="
 
-run_inject_test "inject_single" "{ mss=1460 ipv6=0 split_offset=0 csum_flags=0 ext_type=0 }" 1 1 "Single contiguous mbuf, IPv4, MSS rewrite"
+run_inject_test "inject_single" "{ mss=1460 ipv6=0 split_offset=0 csum_flags=0 ext_type=0 }" 1 1 "Single contiguous mbuf, IPv4, MSS rewrite" "fast_path_count" 1
 
 echo ""
 echo "=========================================="
@@ -284,13 +340,13 @@ echo "=========================================="
 # This is the CRITICAL test for m_copydata() vs direct pointer access
 # Creates multi-mbuf chain where m->m_len < 66 but m_pkthdr.len is full packet
 
-run_inject_test "inject_fragmented" "{ mss=1460 ipv6=0 split_offset=14 csum_flags=0 ext_type=0 }" 1 1 "Fragmented mbuf chain (split at Ether), IPv4, MSS rewrite"
+run_inject_test "inject_fragmented" "{ mss=1460 ipv6=0 split_offset=14 csum_flags=0 ext_type=0 }" 1 1 "Fragmented mbuf chain (split at Ether), IPv4, MSS rewrite" "safe_path_count" 1
 
 # Test with different split points
-run_inject_test "inject_fragmented" "{ mss=1460 ipv6=0 split_offset=10 csum_flags=0 ext_type=0 }" 1 1 "Fragmented mbuf chain (split at byte 10), IPv4, MSS rewrite"
+run_inject_test "inject_fragmented" "{ mss=1460 ipv6=0 split_offset=10 csum_flags=0 ext_type=0 }" 1 1 "Fragmented mbuf chain (split at byte 10), IPv4, MSS rewrite" "safe_path_count" 1
 
 # Test IPv6 fragmented
-run_inject_test "inject_fragmented" "{ mss=1460 ipv6=1 split_offset=14 csum_flags=0 ext_type=0 }" 1 1 "Fragmented mbuf chain, IPv6, MSS rewrite"
+run_inject_test "inject_fragmented" "{ mss=1460 ipv6=1 split_offset=14 csum_flags=0 ext_type=0 }" 1 1 "Fragmented mbuf chain, IPv6, MSS rewrite" "safe_path_count" 1
 
 echo ""
 echo "=========================================="
@@ -299,7 +355,7 @@ echo "=========================================="
 
 # This tests m_unshare() code path when MSS needs rewriting
 
-run_inject_test "inject_shared" "{ mss=1460 ipv6=0 split_offset=0 csum_flags=0 ext_type=0 }" 1 1 "Shared mbuf (M_WRITABLE==0), IPv4, MSS rewrite"
+run_inject_test "inject_shared" "{ mss=1460 ipv6=0 split_offset=0 csum_flags=0 ext_type=0 }" 1 1 "Shared mbuf (M_WRITABLE==0), IPv4, MSS rewrite" "unshare_count" 1
 
 echo ""
 echo "=========================================="
@@ -342,7 +398,7 @@ echo "  Test 6: Edge Cases with Fragmented Mbufs"
 echo "=========================================="
 
 # Test: MSS <= limit, should NOT rewrite even in fragmented mbuf
-run_inject_test "inject_fragmented" "{ mss=1200 ipv6=0 split_offset=14 csum_flags=0 ext_type=0 }" 1 0 "Fragmented mbuf, MSS=1200 (<= 1400): processed but not rewritten"
+run_inject_test "inject_fragmented" "{ mss=1200 ipv6=0 split_offset=14 csum_flags=0 ext_type=0 }" 1 0 "Fragmented mbuf, MSS=1200 (<= 1400): processed but not rewritten" "skip_mss_ok" 1
 
 # Test: Fragmented + Shared (most complex case)
 # Note: This is complex to create and test, so we skip it for now
@@ -364,8 +420,16 @@ echo "=========================================="
 echo "  Final Statistics"
 echo "=========================================="
 echo ""
+if [ "$DEBUG_STATS_ENABLED" = "1" ]; then
+	echo "Debug statistics are enabled - showing detailed counters:"
+fi
 ngctl msg mbuf_test_mss: getstats 2>&1 || echo "Failed to get statistics"
 echo ""
+
+if [ "$DEBUG_STATS_ENABLED" = "1" ]; then
+	echo "Note: Debug statistics verify that expected code paths were exercised."
+	echo ""
+fi
 
 if [ "$TESTS_FAILED" -gt 0 ]; then
 	echo "Result: FAIL"
