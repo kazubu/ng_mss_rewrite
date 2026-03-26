@@ -308,17 +308,12 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m)
 
 	/* Handle VLAN tag */
 	if (ether_type == ETHERTYPE_VLAN) {
-		if (m->m_pkthdr.len < offset + 4)
-			return (m);
 		ether_type = ntohs(*(uint16_t *)(pkt + offset + 2));
 		offset += 4;
 	}
 
 	/* Check IP version and protocol */
 	if (ether_type == ETHERTYPE_IP) {
-		if (m->m_pkthdr.len < offset + sizeof(struct ip))
-			return (m);
-
 		ip4 = (struct ip *)(pkt + offset);
 		ip_hlen = ip4->ip_hl << 2;
 
@@ -349,9 +344,6 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m)
 		offset += ip_hlen;
 
 	} else if (ether_type == ETHERTYPE_IPV6) {
-		if (m->m_pkthdr.len < offset + sizeof(struct ip6_hdr))
-			return (m);
-
 		ip6 = (struct ip6_hdr *)(pkt + offset);
 		ip_hlen = sizeof(struct ip6_hdr);
 
@@ -371,10 +363,6 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m)
 		/* Not IP */
 		return (m);
 	}
-
-	/* Check TCP header */
-	if (m->m_pkthdr.len < offset + sizeof(struct tcphdr))
-		return (m);
 
 	tcp = (struct tcphdr *)(pkt + offset);
 	tcp_hlen = tcp->th_off << 2;
