@@ -315,6 +315,58 @@ ngctl name em0:lower mss0
 ngctl connect mss0: em0: upper upper
 ```
 
+## Performance Benchmarking
+
+Synthetic benchmarks using netgraph without real NICs:
+
+### Quick Benchmark
+
+```bash
+cd test
+sudo ./bench.sh 100000
+```
+
+This creates a test topology: `ng_source -> mss_rewrite -> ng_sink`
+
+The script generates TCP SYN packets with MSS=1460 and measures throughput.
+
+### Comprehensive Benchmark
+
+```bash
+cd test
+sudo ./bench_scenarios.sh
+```
+
+This runs multiple scenarios:
+- TCP SYN with MSS > limit (rewrite needed)
+- TCP SYN with MSS < limit (no rewrite)
+- TCP non-SYN packets (fast path)
+- UDP packets (fastest path)
+
+Each scenario is tested with different configurations:
+- Statistics enabled vs disabled
+- Processing enabled vs disabled (directional filtering)
+
+Expected results:
+- Non-TCP packets: highest throughput (minimal processing)
+- Non-SYN TCP: high throughput (SYN check only)
+- SYN without rewrite: medium throughput (option parsing)
+- SYN with rewrite: lower throughput (full processing)
+- Stats disabled should be 1-2% faster than enabled
+
+### Interpreting Results
+
+Typical performance on modern hardware (example):
+- Non-TCP: 1-2 Mpps (million packets per second)
+- Non-SYN TCP: 800k-1.5 Mpps
+- SYN with rewrite: 500k-1 Mpps
+
+Actual performance depends on:
+- CPU speed and architecture
+- Memory bandwidth
+- Kernel configuration
+- System load
+
 ## Troubleshooting
 
 ### Module fails to load
