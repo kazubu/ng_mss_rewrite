@@ -16,10 +16,15 @@ FreeBSD netgraph node for rewriting TCP MSS (Maximum Segment Size) option in SYN
   - **Default**: Process only incoming packets (interface→kernel)
   - **Configurable**: Enable/disable per direction at runtime
   - Reduces CPU load by ~50% in typical deployments
+  - **Checksum offload aware**: Skips rewrite when TSO/checksum offload is active (upper direction)
 - **Two statistics modes for optimal performance:**
   - **Disabled**: Zero overhead (default)
   - **Per-CPU**: Minimal overhead (~1-2%)
   - Runtime switchable without data loss
+- **Safe mbuf handling:**
+  - Uses `m_copydata()` for header parsing (handles fragmented mbuf chains)
+  - Only modifies mbuf when rewrite is actually needed
+  - Zero pullup overhead for packets that don't need rewriting
 
 ## Limitations
 
