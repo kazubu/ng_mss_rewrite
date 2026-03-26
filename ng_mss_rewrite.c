@@ -351,6 +351,17 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m, int *rewritten)
 	if (m->m_pkthdr.len < offset + tcp_hlen)
 		return (m);
 
+	/* Ensure TCP header length fits within IP payload (not Ethernet padding) */
+	if (ip4 != NULL) {
+		int l4_len = plen - ip_hlen;
+		if (tcp_hlen > l4_len)
+			return (m);
+	} else if (ip6 != NULL) {
+		int l4_len = plen;  /* IPv6 payload length */
+		if (tcp_hlen > l4_len)
+			return (m);
+	}
+
 	/* Fast path: not a SYN packet */
 	if (!(tcp->th_flags & TH_SYN))
 		return (m);
