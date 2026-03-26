@@ -66,11 +66,11 @@ struct ng_mss_stats_percpu {
 struct ng_mss_rewrite_private {
 	hook_p		lower;		/* Connection to physical interface */
 	hook_p		upper;		/* Connection to kernel stack */
-	uint16_t	mss_ipv4;	/* MSS limit for IPv4 */
-	uint16_t	mss_ipv6;	/* MSS limit for IPv6 */
-	volatile u_char	stats_mode;	/* Statistics mode (can be changed at runtime) */
-	uint8_t		enable_lower;	/* Enable processing from lower hook (default: 1) */
-	uint8_t		enable_upper;	/* Enable processing from upper hook (default: 0) */
+	uint16_t	mss_ipv4;	/* MSS limit for IPv4 (atomic access) */
+	uint16_t	mss_ipv6;	/* MSS limit for IPv6 (atomic access) */
+	uint8_t		stats_mode;	/* Statistics mode (atomic access) */
+	uint8_t		enable_lower;	/* Enable processing from lower hook (atomic access) */
+	uint8_t		enable_upper;	/* Enable processing from upper hook (atomic access) */
 
 	/* Per-CPU statistics (allocated once, never freed until shutdown) */
 	struct ng_mss_stats_percpu *stats_percpu;
@@ -269,10 +269,17 @@ tcp_checksum_adjust(uint16_t old_check, uint16_t old_data, uint16_t new_data)
 }
 
 /*
+ * Forward declarations for fast and safe paths
+ */
+static struct mbuf *ng_mss_rewrite_process_fast(priv_p priv, struct mbuf *m, int from_upper);
+static struct mbuf *ng_mss_rewrite_process_safe(priv_p priv, struct mbuf *m, int from_upper);
+
+/*
  * Process and possibly rewrite MSS in a packet
  *
- * Uses m_copydata() for safe header parsing to handle mbuf chain fragmentation.
- * Only modifies mbuf when rewrite is actually needed for optimal performance.
+ * Two-tier approach for optimal performance:
+ * - Fast path: Direct pointer access when mbuf is contiguous
+ * - Safe path: m_copydata() for fragmented mbuf chains
  *
  * Arguments:
  *   priv - private node data
@@ -282,13 +289,235 @@ tcp_checksum_adjust(uint16_t old_check, uint16_t old_data, uint16_t new_data)
 static struct mbuf *
 ng_mss_rewrite_process(priv_p priv, struct mbuf *m, int from_upper)
 {
+	/*
+	 * Typical packet length check for fast path:
+	 * Ether(14) + IP(20) + TCP(20) + Options(12) = 66 bytes
+	 * Most non-fragmented SYN packets will have at least this much contiguous.
+	 */
+	if (m->m_len >= 66) {
+		/* Fast path: contiguous mbuf, use direct pointer access */
+		return ng_mss_rewrite_process_fast(priv, m, from_upper);
+	} else {
+		/* Safe path: potentially fragmented, use m_copydata() */
+		return ng_mss_rewrite_process_safe(priv, m, from_upper);
+	}
+}
+
+/*
+ * Fast path: Process packet with direct pointer access
+ * Assumes m->m_len >= 66 (typical header length)
+ */
+static struct mbuf *
+ng_mss_rewrite_process_fast(priv_p priv, struct mbuf *m, int from_upper)
+{
+	struct ether_header *eh;
+	struct ip *ip4 = NULL;
+	struct ip6_hdr *ip6 = NULL;
+	struct tcphdr *tcp;
+	uint8_t *options, *pkt;
+	uint16_t ether_type, max_mss, old_mss, plen;
+	int offset, ip_hlen, tcp_hlen, opt_len, mss_offset, i;
+
+#if ENABLE_STATS
+	uint8_t stats_mode;
+	struct ng_mss_stats_percpu *st = NULL;
+#endif
+
+	/* Fast path: ensure minimum packet length */
+	if (m->m_pkthdr.len < sizeof(struct ether_header) + sizeof(struct ip) + sizeof(struct tcphdr))
+		return (m);
+
+	pkt = mtod(m, uint8_t *);
+	eh = (struct ether_header *)pkt;
+	ether_type = ntohs(eh->ether_type);
+	offset = sizeof(struct ether_header);
+
+	/* Handle VLAN tag */
+	if (ether_type == ETHERTYPE_VLAN) {
+		if (m->m_pkthdr.len < offset + 4)
+			return (m);
+		/* Fall back to safe path if VLAN extends beyond m_len */
+		if (m->m_len < offset + 4)
+			return ng_mss_rewrite_process_safe(priv, m, from_upper);
+		ether_type = ntohs(*(uint16_t *)(pkt + offset + 2));
+		offset += 4;
+	}
+
+	/* Parse IP header */
+	if (ether_type == ETHERTYPE_IP) {
+		/* IPv4 */
+		if (m->m_pkthdr.len < offset + sizeof(struct ip))
+			return (m);
+		if (m->m_len < offset + sizeof(struct ip))
+			return ng_mss_rewrite_process_safe(priv, m, from_upper);
+
+		ip4 = (struct ip *)(pkt + offset);
+		ip_hlen = (ip4->ip_hl & 0x0f) << 2;
+
+		if (ip_hlen < (int)sizeof(struct ip) || m->m_pkthdr.len < offset + ip_hlen)
+			return (m);
+		if (m->m_len < offset + ip_hlen)
+			return ng_mss_rewrite_process_safe(priv, m, from_upper);
+
+		if (ip4->ip_p != IPPROTO_TCP)
+			return (m);
+		if (ntohs(ip4->ip_off) & (IP_MF | IP_OFFMASK))
+			return (m);
+
+		plen = ntohs(ip4->ip_len);
+		if (plen < ip_hlen + (int)sizeof(struct tcphdr) || plen > m->m_pkthdr.len - offset)
+			return (m);
+
+		max_mss = atomic_load_acq_16(&priv->mss_ipv4);
+		offset += ip_hlen;
+
+	} else if (ether_type == ETHERTYPE_IPV6) {
+		/* IPv6 */
+		if (m->m_pkthdr.len < offset + sizeof(struct ip6_hdr))
+			return (m);
+		if (m->m_len < offset + sizeof(struct ip6_hdr))
+			return ng_mss_rewrite_process_safe(priv, m, from_upper);
+
+		ip6 = (struct ip6_hdr *)(pkt + offset);
+		ip_hlen = sizeof(struct ip6_hdr);
+
+		if (ip6->ip6_nxt != IPPROTO_TCP)
+			return (m);
+
+		plen = ntohs(ip6->ip6_plen);
+		if (plen < (int)sizeof(struct tcphdr) || plen > m->m_pkthdr.len - offset - ip_hlen)
+			return (m);
+
+		max_mss = atomic_load_acq_16(&priv->mss_ipv6);
+		offset += ip_hlen;
+
+	} else {
+		return (m);
+	}
+
+	/* Parse TCP header */
+	if (m->m_pkthdr.len < offset + sizeof(struct tcphdr))
+		return (m);
+	if (m->m_len < offset + sizeof(struct tcphdr))
+		return ng_mss_rewrite_process_safe(priv, m, from_upper);
+
+	tcp = (struct tcphdr *)(pkt + offset);
+	tcp_hlen = (tcp->th_off & 0xf) << 2;
+
+	if (tcp_hlen < (int)sizeof(struct tcphdr) || m->m_pkthdr.len < offset + tcp_hlen)
+		return (m);
+
+	if (ip4) {
+		if (tcp_hlen > plen - ip_hlen)
+			return (m);
+	} else {
+		if (tcp_hlen > plen)
+			return (m);
+	}
+
+	if (!(tcp->th_flags & TH_SYN))
+		return (m);
+
+#if ENABLE_STATS
+	stats_mode = atomic_load_acq_8(&priv->stats_mode);
+	if (stats_mode == STATS_MODE_PERCPU)
+		st = &priv->stats_percpu[curcpu];
+	if (st != NULL)
+		st->packets_processed++;
+#endif
+
+	/* Fall back to safe path if TCP options extend beyond m_len */
+	if (m->m_len < offset + tcp_hlen)
+		return ng_mss_rewrite_process_safe(priv, m, from_upper);
+
+	/* Search for MSS option */
+	options = (uint8_t *)(tcp + 1);
+	opt_len = tcp_hlen - sizeof(struct tcphdr);
+	mss_offset = -1;
+
+	/* Fast path for common positions */
+	if (opt_len >= 4 && options[0] == TCPOPT_MAXSEG && options[1] == 4) {
+		mss_offset = 0;
+	} else if (opt_len >= 5 && options[0] == TCPOPT_NOP &&
+	           options[1] == TCPOPT_MAXSEG && options[2] == 4) {
+		mss_offset = 1;
+	} else if (opt_len >= 6 && options[0] == TCPOPT_NOP && options[1] == TCPOPT_NOP &&
+	           options[2] == TCPOPT_MAXSEG && options[3] == 4) {
+		mss_offset = 2;
+	} else {
+		/* Slow path: walk options */
+		for (i = 0; i < opt_len; ) {
+			uint8_t opt_type = options[i];
+			uint8_t opt_size;
+
+			if (opt_type == TCPOPT_EOL)
+				break;
+			if (opt_type == TCPOPT_NOP) {
+				i++;
+				continue;
+			}
+			if (i + 1 >= opt_len)
+				break;
+
+			opt_size = options[i + 1];
+			if (opt_size < 2 || i + opt_size > opt_len)
+				break;
+
+			if (opt_type == TCPOPT_MAXSEG && opt_size == 4) {
+				mss_offset = i;
+				break;
+			}
+			i += opt_size;
+		}
+	}
+
+	if (mss_offset < 0)
+		return (m);
+
+	old_mss = (options[mss_offset + 2] << 8) | options[mss_offset + 3];
+	if (old_mss <= max_mss)
+		return (m);
+
+	/* Checksum offload check for upper direction */
+	if (from_upper && (m->m_pkthdr.csum_flags & (CSUM_TCP | CSUM_TSO)))
+		return (m);
+
+	/* Ensure writable */
+	if (M_WRITABLE(m) == 0) {
+		m = m_unshare(m, M_NOWAIT);
+		if (m == NULL)
+			return (NULL);
+		/* Recalculate pointers */
+		pkt = mtod(m, uint8_t *);
+		tcp = (struct tcphdr *)(pkt + offset);
+		options = (uint8_t *)(tcp + 1);
+	}
+
+	/* Update checksum and MSS */
+	tcp->th_sum = tcp_checksum_adjust(tcp->th_sum, htons(old_mss), htons(max_mss));
+	options[mss_offset + 2] = (max_mss >> 8) & 0xff;
+	options[mss_offset + 3] = max_mss & 0xff;
+
+#if ENABLE_STATS
+	if (st != NULL)
+		st->packets_rewritten++;
+#endif
+
+	return (m);
+}
+
+/*
+ * Safe path: Process packet using m_copydata() for fragmented mbufs
+ */
+static struct mbuf *
+ng_mss_rewrite_process_safe(priv_p priv, struct mbuf *m, int from_upper)
+{
 	/* Local copies for safe parsing via m_copydata() */
 	struct ether_header eh;
 	struct ip ip4;
 	struct ip6_hdr ip6;
-	struct tcphdr tcp;
-	uint8_t tcp_opts[40];  /* Maximum TCP options length */
-	uint8_t vlan_buf[4];   /* VLAN tag buffer */
+	uint8_t tcp_opts[40];
+	uint8_t vlan_buf[4];
 
 	/* Parsing state */
 	uint16_t ether_type, max_mss, old_mss, plen;
@@ -356,7 +585,7 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m, int from_upper)
 		if (plen > m->m_pkthdr.len - offset)
 			return (m);
 
-		max_mss = priv->mss_ipv4;
+		max_mss = atomic_load_acq_16(&priv->mss_ipv4);
 		offset += ip_hlen;
 		is_ipv4 = 1;
 
@@ -377,7 +606,7 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m, int from_upper)
 		if (plen < (int)sizeof(struct tcphdr) || plen > m->m_pkthdr.len - offset - ip_hlen)
 			return (m);
 
-		max_mss = priv->mss_ipv6;
+		max_mss = atomic_load_acq_16(&priv->mss_ipv6);
 		offset += ip_hlen;
 		is_ipv4 = 0;
 
@@ -422,12 +651,9 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m, int from_upper)
 			return (m);
 	}
 
-	/* Read full TCP header for checksum */
-	m_copydata(m, offset, sizeof(struct tcphdr), (caddr_t)&tcp);
-
 #if ENABLE_STATS
 	/* Snapshot stats mode and cache pointer */
-	stats_mode = priv->stats_mode;
+	stats_mode = atomic_load_acq_8(&priv->stats_mode);
 	if (stats_mode == STATS_MODE_PERCPU)
 		st = &priv->stats_percpu[curcpu];
 
@@ -578,22 +804,22 @@ ng_mss_rewrite_constructor(node_p node)
 	priv_p priv;
 
 	priv = malloc(sizeof(*priv), M_NETGRAPH, M_WAITOK | M_ZERO);
-	priv->mss_ipv4 = DEFAULT_MSS_IPV4;
-	priv->mss_ipv6 = DEFAULT_MSS_IPV6;
+	atomic_store_rel_16(&priv->mss_ipv4, DEFAULT_MSS_IPV4);
+	atomic_store_rel_16(&priv->mss_ipv6, DEFAULT_MSS_IPV6);
 	/* Default: process only from lower hook (interface->kernel) */
-	priv->enable_lower = 1;
-	priv->enable_upper = 0;
+	atomic_store_rel_8(&priv->enable_lower, 1);
+	atomic_store_rel_8(&priv->enable_upper, 0);
 
 #if ENABLE_STATS
 	/* Default to disabled statistics for maximum performance */
-	priv->stats_mode = STATS_MODE_DISABLED;
+	atomic_store_rel_8(&priv->stats_mode, STATS_MODE_DISABLED);
 	/* Allocate per-CPU array immediately (never-free design) */
 	priv->stats_percpu = malloc(sizeof(struct ng_mss_stats_percpu) * mp_ncpus,
 	    M_NETGRAPH, M_WAITOK | M_ZERO);
 	/* Initialize mutex for getstats/resetstats */
 	mtx_init(&priv->stats_mtx, "ng_mss_stats", NULL, MTX_DEF);
 #else
-	priv->stats_mode = STATS_MODE_DISABLED;
+	atomic_store_rel_8(&priv->stats_mode, STATS_MODE_DISABLED);
 	priv->stats_percpu = NULL;
 #endif
 
@@ -680,8 +906,8 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 				break;
 			}
 
-			priv->mss_ipv4 = conf->mss_ipv4;
-			priv->mss_ipv6 = conf->mss_ipv6;
+			atomic_store_rel_16(&priv->mss_ipv4, conf->mss_ipv4);
+			atomic_store_rel_16(&priv->mss_ipv6, conf->mss_ipv6);
 			break;
 		}
 
@@ -785,7 +1011,7 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 			}
 
 			/* Update mode (stats_percpu already allocated at init, never freed) */
-			priv->stats_mode = mode_conf->mode;
+			atomic_store_rel_8(&priv->stats_mode, mode_conf->mode);
 #else
 			error = EOPNOTSUPP;
 #endif
@@ -821,8 +1047,8 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 			}
 
 			dir_conf = (struct ng_mss_rewrite_direction *)msg->data;
-			priv->enable_lower = dir_conf->enable_lower ? 1 : 0;
-			priv->enable_upper = dir_conf->enable_upper ? 1 : 0;
+			atomic_store_rel_8(&priv->enable_lower, dir_conf->enable_lower ? 1 : 0);
+			atomic_store_rel_8(&priv->enable_upper, dir_conf->enable_upper ? 1 : 0);
 			break;
 		}
 
@@ -877,7 +1103,7 @@ ng_mss_rewrite_rcvdata(hook_p hook, item_p item)
 	if (hook == priv->lower) {
 		out_hook = priv->upper;
 		/* Check if lower->upper processing is enabled (interface->kernel) */
-		if (priv->enable_lower) {
+		if (atomic_load_acq_8(&priv->enable_lower)) {
 			m = ng_mss_rewrite_process(priv, m, 0);  /* from_upper=0 */
 			if (m == NULL) {
 				/* Packet was dropped during processing */
@@ -888,7 +1114,7 @@ ng_mss_rewrite_rcvdata(hook_p hook, item_p item)
 	} else if (hook == priv->upper) {
 		out_hook = priv->lower;
 		/* Check if upper->lower processing is enabled (kernel->interface) */
-		if (priv->enable_upper) {
+		if (atomic_load_acq_8(&priv->enable_upper)) {
 			m = ng_mss_rewrite_process(priv, m, 1);  /* from_upper=1 */
 			if (m == NULL) {
 				/* Packet was dropped during processing */
