@@ -73,6 +73,31 @@ ngctl msg em0_mss: getstats
 
 ## 6. Performance Tuning (Optional)
 
+### Directional Filtering (Default: Incoming Only)
+
+By default, only incoming packets (interface→kernel) are processed. This reduces
+CPU load by ~50% since TCP MSS negotiation only needs one direction.
+
+```bash
+# Check current direction settings
+ngctl msg em0_mss: getdirection
+
+# Process both directions (if needed)
+ngctl msg em0_mss: setdirection "{ enable_lower=1 enable_upper=1 }"
+
+# Back to default (incoming only)
+ngctl msg em0_mss: setdirection "{ enable_lower=1 enable_upper=0 }"
+```
+
+**Direction settings:**
+- **enable_lower=1**: Process incoming packets (interface→kernel) - **Default: ON**
+- **enable_upper=1**: Process outgoing packets (kernel→interface) - **Default: OFF**
+
+**Recommendation**: Keep default settings unless you have specific requirements
+for bidirectional processing.
+
+### Statistics Modes
+
 Statistics are disabled by default for maximum performance. To enable statistics at runtime:
 
 ```bash

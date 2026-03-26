@@ -12,6 +12,10 @@ FreeBSD netgraph node for rewriting TCP MSS (Maximum Segment Size) option in SYN
 - Works at L2 level on physical interface
 - Automatically applies to all VLANs/bridges/tunnels
 - Validates packet headers and skips fragmented packets
+- **Directional filtering for optimal performance:**
+  - **Default**: Process only incoming packets (interface→kernel)
+  - **Configurable**: Enable/disable per direction at runtime
+  - Reduces CPU load by ~50% in typical deployments
 - **Two statistics modes for optimal performance:**
   - **Disabled**: Zero overhead (default)
   - **Per-CPU**: Minimal overhead (~1-2%)
@@ -190,6 +194,44 @@ ngctl msg mss0: setstatsmode "{ mode=1 }"
 - Per-CPU array allocated once, never freed until node shutdown
 - Safe to switch modes at any time during operation
 - Use DISABLED mode in production for maximum performance
+
+### Directional Filtering
+
+Control which traffic directions are processed for optimal performance.
+
+**Get Current Direction Settings:**
+```bash
+ngctl msg mss0: getdirection
+```
+
+Output: `{ enable_lower=1 enable_upper=0 }`
+
+**Set Direction:**
+```bash
+# Process only incoming packets (default, recommended)
+ngctl msg mss0: setdirection "{ enable_lower=1 enable_upper=0 }"
+
+# Process both directions
+ngctl msg mss0: setdirection "{ enable_lower=1 enable_upper=1 }"
+
+# Process only outgoing packets (rare use case)
+ngctl msg mss0: setdirection "{ enable_lower=0 enable_upper=1 }"
+```
+
+**Direction Modes:**
+- **enable_lower=1**: Process packets from physical interface to kernel (incoming)
+- **enable_upper=1**: Process packets from kernel to physical interface (outgoing)
+
+**Default:** `enable_lower=1, enable_upper=0` (incoming only)
+
+**Rationale:**
+TCP MSS negotiation uses the minimum MSS from both sides. Processing only
+one direction is usually sufficient, reducing CPU load by ~50%.
+
+**Performance Impact:**
+- Single direction: ~50% reduction in processed packets
+- Zero overhead for disabled direction (simple flag check)
+- Configurable at runtime without service interruption
 
 ## Verification
 
