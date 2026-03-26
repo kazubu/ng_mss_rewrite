@@ -69,6 +69,8 @@ struct ng_mss_rewrite_private {
 	uint16_t	mss_ipv4;	/* MSS limit for IPv4 */
 	uint16_t	mss_ipv6;	/* MSS limit for IPv6 */
 	volatile u_char	stats_mode;	/* Statistics mode (can be changed at runtime) */
+	uint8_t		enable_lower;	/* Enable processing from lower hook (default: 1) */
+	uint8_t		enable_upper;	/* Enable processing from upper hook (default: 0) */
 
 	/* Per-CPU statistics (allocated once, never freed until shutdown) */
 	struct ng_mss_stats_percpu *stats_percpu;
@@ -90,6 +92,8 @@ enum {
 	NGM_MSS_REWRITE_RESET_STATS,
 	NGM_MSS_REWRITE_SET_STATS_MODE,
 	NGM_MSS_REWRITE_GET_STATS_MODE,
+	NGM_MSS_REWRITE_SET_DIRECTION,
+	NGM_MSS_REWRITE_GET_DIRECTION,
 };
 
 /* Control message structures */
@@ -105,6 +109,11 @@ struct ng_mss_rewrite_stats {
 
 struct ng_mss_rewrite_stats_mode {
 	uint8_t		mode;		/* Statistics mode */
+};
+
+struct ng_mss_rewrite_direction {
+	uint8_t		enable_lower;	/* Process packets from lower hook */
+	uint8_t		enable_upper;	/* Process packets from upper hook */
 };
 
 /* Parse type for config structure */
@@ -137,6 +146,17 @@ static const struct ng_parse_struct_field ng_mss_rewrite_stats_mode_fields[] = {
 static const struct ng_parse_type ng_mss_rewrite_stats_mode_type = {
 	&ng_parse_struct_type,
 	&ng_mss_rewrite_stats_mode_fields
+};
+
+/* Parse type for direction structure */
+static const struct ng_parse_struct_field ng_mss_rewrite_direction_fields[] = {
+	{ "enable_lower",	&ng_parse_uint8_type },
+	{ "enable_upper",	&ng_parse_uint8_type },
+	{ NULL }
+};
+static const struct ng_parse_type ng_mss_rewrite_direction_type = {
+	&ng_parse_struct_type,
+	&ng_mss_rewrite_direction_fields
 };
 
 /* List of commands and how to convert arguments to/from ASCII */
@@ -182,6 +202,20 @@ static const struct ng_cmdlist ng_mss_rewrite_cmdlist[] = {
 		"getstatsmode",
 		NULL,
 		&ng_mss_rewrite_stats_mode_type
+	},
+	{
+		NGM_MSS_REWRITE_COOKIE,
+		NGM_MSS_REWRITE_SET_DIRECTION,
+		"setdirection",
+		&ng_mss_rewrite_direction_type,
+		NULL
+	},
+	{
+		NGM_MSS_REWRITE_COOKIE,
+		NGM_MSS_REWRITE_GET_DIRECTION,
+		"getdirection",
+		NULL,
+		&ng_mss_rewrite_direction_type
 	},
 	{ 0 }
 };
@@ -468,6 +502,9 @@ ng_mss_rewrite_constructor(node_p node)
 	priv = malloc(sizeof(*priv), M_NETGRAPH, M_WAITOK | M_ZERO);
 	priv->mss_ipv4 = DEFAULT_MSS_IPV4;
 	priv->mss_ipv6 = DEFAULT_MSS_IPV6;
+	/* Default: process only from lower hook (interface->kernel) */
+	priv->enable_lower = 1;
+	priv->enable_upper = 0;
 
 #if ENABLE_STATS
 	/* Default to disabled statistics for maximum performance */
@@ -696,6 +733,37 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 			break;
 		}
 
+		case NGM_MSS_REWRITE_SET_DIRECTION:
+		{
+			struct ng_mss_rewrite_direction *dir_conf;
+
+			if (msg->header.arglen != sizeof(*dir_conf)) {
+				error = EINVAL;
+				break;
+			}
+
+			dir_conf = (struct ng_mss_rewrite_direction *)msg->data;
+			priv->enable_lower = dir_conf->enable_lower ? 1 : 0;
+			priv->enable_upper = dir_conf->enable_upper ? 1 : 0;
+			break;
+		}
+
+		case NGM_MSS_REWRITE_GET_DIRECTION:
+		{
+			struct ng_mss_rewrite_direction *dir_conf;
+
+			NG_MKRESPONSE(resp, msg, sizeof(*dir_conf), M_NOWAIT);
+			if (resp == NULL) {
+				error = ENOMEM;
+				break;
+			}
+
+			dir_conf = (struct ng_mss_rewrite_direction *)resp->data;
+			dir_conf->enable_lower = priv->enable_lower;
+			dir_conf->enable_upper = priv->enable_upper;
+			break;
+		}
+
 		default:
 			error = EINVAL;
 			break;
@@ -727,12 +795,32 @@ ng_mss_rewrite_rcvdata(hook_p hook, item_p item)
 
 	NGI_GET_M(item, m);
 
-	/* Determine output hook */
-	if (hook == priv->lower)
+	/* Determine output hook and check if processing is enabled for this direction */
+	if (hook == priv->lower) {
 		out_hook = priv->upper;
-	else if (hook == priv->upper)
+		/* Check if lower->upper processing is enabled */
+		if (priv->enable_lower) {
+			int rewritten;
+			m = ng_mss_rewrite_process(priv, m, &rewritten);
+			if (m == NULL) {
+				/* Packet was dropped during processing */
+				NG_FREE_ITEM(item);
+				return (0);
+			}
+		}
+	} else if (hook == priv->upper) {
 		out_hook = priv->lower;
-	else {
+		/* Check if upper->lower processing is enabled */
+		if (priv->enable_upper) {
+			int rewritten;
+			m = ng_mss_rewrite_process(priv, m, &rewritten);
+			if (m == NULL) {
+				/* Packet was dropped during processing */
+				NG_FREE_ITEM(item);
+				return (0);
+			}
+		}
+	} else {
 		m_freem(m);
 		NG_FREE_ITEM(item);
 		return (EINVAL);
@@ -742,17 +830,6 @@ ng_mss_rewrite_rcvdata(hook_p hook, item_p item)
 		m_freem(m);
 		NG_FREE_ITEM(item);
 		return (ENOTCONN);
-	}
-
-	/* Process the packet */
-	{
-		int rewritten;
-		m = ng_mss_rewrite_process(priv, m, &rewritten);
-		if (m == NULL) {
-			/* Packet was dropped during processing */
-			NG_FREE_ITEM(item);
-			return (0);
-		}
 	}
 
 	/* Put the (possibly modified) mbuf back into the item */
