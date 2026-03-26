@@ -417,16 +417,13 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m, int *rewritten)
 			uint16_t old_mss = (options[i + 2] << 8) | options[i + 3];
 
 			if (old_mss > max_mss) {
-				/* MSS rewrite needed - make mbuf writable now */
+				/* MSS rewrite needed - ensure mbuf is writable */
 				if (M_WRITABLE(m) == 0) {
-					struct mbuf *m_new = m_dup(m, M_NOWAIT);
-					if (m_new == NULL) {
-						m_freem(m);
+					m = m_unshare(m, M_NOWAIT);
+					if (m == NULL)
 						return (NULL);
-					}
-					m_freem(m);
-					m = m_new;
-					/* Recalculate pointers */
+
+					/* Recalculate pointers after unshare */
 					pkt = mtod(m, uint8_t *);
 					if (ip4)
 						ip4 = (struct ip *)(pkt + offset - ip_hlen);
