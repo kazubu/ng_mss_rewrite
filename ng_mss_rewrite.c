@@ -66,9 +66,9 @@ struct ng_mss_stats_percpu {
 	uint64_t	packets_processed;
 	uint64_t	packets_rewritten;
 #if ENABLE_DEBUG_STATS
-	/* Code path tracking */
-	uint64_t	fast_path_count;
-	uint64_t	safe_path_count;
+	/* Code path dispatch tracking (entry point decision) */
+	uint64_t	fast_dispatch_count;
+	uint64_t	safe_dispatch_count;
 	uint64_t	pullup_count;
 	uint64_t	pullup_failed;
 	uint64_t	unshare_count;
@@ -97,8 +97,8 @@ struct ng_mss_rewrite_private {
 	uint64_t	baseline_processed;
 	uint64_t	baseline_rewritten;
 #if ENABLE_DEBUG_STATS
-	uint64_t	baseline_fast_path_count;
-	uint64_t	baseline_safe_path_count;
+	uint64_t	baseline_fast_dispatch_count;
+	uint64_t	baseline_safe_dispatch_count;
 	uint64_t	baseline_pullup_count;
 	uint64_t	baseline_pullup_failed;
 	uint64_t	baseline_unshare_count;
@@ -135,9 +135,9 @@ struct ng_mss_rewrite_stats {
 	uint64_t	packets_processed;
 	uint64_t	packets_rewritten;
 #if ENABLE_DEBUG_STATS
-	/* Code path tracking */
-	uint64_t	fast_path_count;
-	uint64_t	safe_path_count;
+	/* Code path dispatch tracking (entry point decision) */
+	uint64_t	fast_dispatch_count;
+	uint64_t	safe_dispatch_count;
 	uint64_t	pullup_count;
 	uint64_t	pullup_failed;
 	uint64_t	unshare_count;
@@ -174,8 +174,8 @@ static const struct ng_parse_struct_field ng_mss_rewrite_stats_fields[] = {
 	{ "packets_processed",	&ng_parse_uint64_type },
 	{ "packets_rewritten",	&ng_parse_uint64_type },
 #if ENABLE_DEBUG_STATS
-	{ "fast_path_count",	&ng_parse_uint64_type },
-	{ "safe_path_count",	&ng_parse_uint64_type },
+	{ "fast_dispatch_count",	&ng_parse_uint64_type },
+	{ "safe_dispatch_count",	&ng_parse_uint64_type },
 	{ "pullup_count",	&ng_parse_uint64_type },
 	{ "pullup_failed",	&ng_parse_uint64_type },
 	{ "unshare_count",	&ng_parse_uint64_type },
@@ -353,7 +353,7 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m, int from_upper)
 		{
 			uint8_t stats_mode = atomic_load_acq_8(&priv->stats_mode);
 			if (stats_mode == STATS_MODE_PERCPU)
-				priv->stats_percpu[curcpu].fast_path_count++;
+				priv->stats_percpu[curcpu].fast_dispatch_count++;
 		}
 #endif
 		return ng_mss_rewrite_process_fast(priv, m, from_upper);
@@ -363,7 +363,7 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m, int from_upper)
 		{
 			uint8_t stats_mode = atomic_load_acq_8(&priv->stats_mode);
 			if (stats_mode == STATS_MODE_PERCPU)
-				priv->stats_percpu[curcpu].safe_path_count++;
+				priv->stats_percpu[curcpu].safe_dispatch_count++;
 		}
 #endif
 		return ng_mss_rewrite_process_safe(priv, m, from_upper);
@@ -1068,8 +1068,8 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 			stats->packets_processed = 0;
 			stats->packets_rewritten = 0;
 #if ENABLE_DEBUG_STATS
-			stats->fast_path_count = 0;
-			stats->safe_path_count = 0;
+			stats->fast_dispatch_count = 0;
+			stats->safe_dispatch_count = 0;
 			stats->pullup_count = 0;
 			stats->pullup_failed = 0;
 			stats->unshare_count = 0;
@@ -1085,8 +1085,8 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 					stats->packets_processed += priv->stats_percpu[cpu].packets_processed;
 					stats->packets_rewritten += priv->stats_percpu[cpu].packets_rewritten;
 #if ENABLE_DEBUG_STATS
-					stats->fast_path_count += priv->stats_percpu[cpu].fast_path_count;
-					stats->safe_path_count += priv->stats_percpu[cpu].safe_path_count;
+					stats->fast_dispatch_count += priv->stats_percpu[cpu].fast_dispatch_count;
+					stats->safe_dispatch_count += priv->stats_percpu[cpu].safe_dispatch_count;
 					stats->pullup_count += priv->stats_percpu[cpu].pullup_count;
 					stats->pullup_failed += priv->stats_percpu[cpu].pullup_failed;
 					stats->unshare_count += priv->stats_percpu[cpu].unshare_count;
@@ -1102,8 +1102,8 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 			stats->packets_processed -= priv->baseline_processed;
 			stats->packets_rewritten -= priv->baseline_rewritten;
 #if ENABLE_DEBUG_STATS
-			stats->fast_path_count -= priv->baseline_fast_path_count;
-			stats->safe_path_count -= priv->baseline_safe_path_count;
+			stats->fast_dispatch_count -= priv->baseline_fast_dispatch_count;
+			stats->safe_dispatch_count -= priv->baseline_safe_dispatch_count;
 			stats->pullup_count -= priv->baseline_pullup_count;
 			stats->pullup_failed -= priv->baseline_pullup_failed;
 			stats->unshare_count -= priv->baseline_unshare_count;
@@ -1143,8 +1143,8 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 					total_processed += priv->stats_percpu[cpu].packets_processed;
 					total_rewritten += priv->stats_percpu[cpu].packets_rewritten;
 #if ENABLE_DEBUG_STATS
-					total_fast_path += priv->stats_percpu[cpu].fast_path_count;
-					total_safe_path += priv->stats_percpu[cpu].safe_path_count;
+					total_fast_path += priv->stats_percpu[cpu].fast_dispatch_count;
+					total_safe_path += priv->stats_percpu[cpu].safe_dispatch_count;
 					total_pullup += priv->stats_percpu[cpu].pullup_count;
 					total_pullup_failed += priv->stats_percpu[cpu].pullup_failed;
 					total_unshare += priv->stats_percpu[cpu].unshare_count;
@@ -1159,8 +1159,8 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 			priv->baseline_processed = total_processed;
 			priv->baseline_rewritten = total_rewritten;
 #if ENABLE_DEBUG_STATS
-			priv->baseline_fast_path_count = total_fast_path;
-			priv->baseline_safe_path_count = total_safe_path;
+			priv->baseline_fast_dispatch_count = total_fast_path;
+			priv->baseline_safe_dispatch_count = total_safe_path;
 			priv->baseline_pullup_count = total_pullup;
 			priv->baseline_pullup_failed = total_pullup_failed;
 			priv->baseline_unshare_count = total_unshare;

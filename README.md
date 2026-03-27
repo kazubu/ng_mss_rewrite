@@ -168,7 +168,7 @@ When the module is built with `DEBUG_STATS=1`, additional counters are available
 ```
 Rec'd response "getstats" (4) from "mss0:":
 Args:   { packets_processed=100 packets_rewritten=50
-          fast_path_count=90 safe_path_count=10
+          fast_dispatch_count=90 safe_dispatch_count=10
           pullup_count=5 unshare_count=3
           skip_mss_ok=50 skip_offload=0 }
 ```
@@ -176,8 +176,8 @@ Args:   { packets_processed=100 packets_rewritten=50
 **Debug statistics fields:**
 
 **Code Path Tracking:**
-- `fast_path_count`: Packets processed via fast path (contiguous mbuf, m_len >= 66)
-- `safe_path_count`: Packets processed via safe path (fragmented mbuf chain)
+- `fast_dispatch_count`: Packets processed via fast path (contiguous mbuf, m_len >= 66)
+- `safe_dispatch_count`: Packets processed via safe path (fragmented mbuf chain)
 
 **Mbuf Operations:**
 - `pullup_count`: Number of times `m_pullup()` was called to make headers contiguous
