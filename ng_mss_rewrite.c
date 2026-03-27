@@ -340,9 +340,10 @@ static struct mbuf *ng_mss_rewrite_process_safe(priv_p priv, struct mbuf *m, int
 /*
  * Process and possibly rewrite MSS in a packet
  *
- * Two-tier approach for optimal performance:
- * - Fast path: Direct pointer access when mbuf is contiguous
- * - Safe path: m_copydata() for fragmented mbuf chains
+ * Two-tier dispatch for optimal performance:
+ * - Fast path: Direct pointer access when m_len >= NG_MSS_FAST_PATH_MIN_LEN (58)
+ *              May fall back to safe path for IP/TCP options beyond m_len
+ * - Safe path: m_copydata() for m_len < 58 or fallback from fast path
  *
  * Arguments:
  *   priv - private node data
@@ -359,9 +360,13 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m, int from_upper)
 	 * IP/TCP options are checked dynamically inside fast path.
 	 */
 	if (m->m_len >= NG_MSS_FAST_PATH_MIN_LEN) {
-		/* Fast path: contiguous mbuf, use direct pointer access */
+		/* Fast path: m_len >= 58, try direct pointer access */
 #if ENABLE_DEBUG_STATS
 		{
+			/*
+			 * Track fast path entry (not final execution path).
+			 * May still fall back to safe path for IP/TCP options.
+			 */
 			uint8_t stats_mode = atomic_load_acq_8(&priv->stats_mode);
 			if (stats_mode == STATS_MODE_PERCPU)
 				priv->stats_percpu[curcpu].fast_dispatch_count++;
@@ -369,9 +374,13 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m, int from_upper)
 #endif
 		return ng_mss_rewrite_process_fast(priv, m, from_upper);
 	} else {
-		/* Safe path: potentially fragmented, use m_copydata() */
+		/* Safe path: m_len < 58, use m_copydata() from start */
 #if ENABLE_DEBUG_STATS
 		{
+			/*
+			 * Track safe path direct entry.
+			 * Does not count fallbacks from fast path.
+			 */
 			uint8_t stats_mode = atomic_load_acq_8(&priv->stats_mode);
 			if (stats_mode == STATS_MODE_PERCPU)
 				priv->stats_percpu[curcpu].safe_dispatch_count++;

@@ -10,7 +10,7 @@ FreeBSD netgraph node for rewriting TCP MSS (Maximum Segment Size) option in SYN
 - Only rewrites if existing MSS > configured MSS (never increases MSS)
 - High performance (processes packets at line rate)
 - Works at L2 level on physical interface
-- Automatically applies to all VLANs/bridges/tunnels
+- Automatically affects all VLAN interfaces created on top (em0.100, em0.200, etc.)
 - Validates packet headers and skips fragmented packets
 - **Directional filtering for optimal performance:**
   - **Default**: Process only incoming packets (interface→kernel)
@@ -176,8 +176,11 @@ Args:   { packets_processed=100 packets_rewritten=50
 **Debug statistics fields:**
 
 **Code Path Tracking:**
-- `fast_dispatch_count`: Packets processed via fast path (contiguous mbuf, m_len >= 66)
-- `safe_dispatch_count`: Packets processed via safe path (fragmented mbuf chain)
+- `fast_dispatch_count`: Packets entering fast path (m_len >= 58, may fallback to safe path)
+- `safe_dispatch_count`: Packets entering safe path directly (m_len < 58)
+
+Note: These counters track initial dispatch decision, not final execution path.
+Fast path may fall back to safe path for TCP options/IP options beyond m_len.
 
 **Mbuf Operations:**
 - `pullup_count`: Number of times `m_pullup()` was called to make headers contiguous
@@ -354,7 +357,7 @@ ngctl msg mss0: setmss "{ mss_ipv4=1400 mss_ipv6=1380 }"
 
 ```bash
 # Single configuration at physical interface level
-# Automatically applies to all VLANs (em0.100, em0.200, etc.)
+# Automatically affects all VLAN interfaces on top (em0.100, em0.200, etc.)
 ngctl mkpeer em0: mss_rewrite lower lower
 ngctl name em0:lower mss0
 ngctl connect mss0: em0: upper upper
@@ -426,7 +429,7 @@ This test suite validates:
 ### 1. Fragmented Mbuf Chains (Critical)
 Tests packets where headers span multiple mbuf buffers:
 - Tests the safe path using `m_copydata()` for header parsing
-- Validates that `m->m_len < 66` but `m_pkthdr.len >= full_packet_length` is handled correctly
+- Validates that `m->m_len < 58` but `m_pkthdr.len >= full_packet_length` is handled correctly
 - Different split points (at Ethernet boundary, mid-header, etc.)
 - Both IPv4 and IPv6 fragmented packets
 
