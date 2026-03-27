@@ -456,15 +456,27 @@ echo ""
 # Split at 58:
 #   first mbuf: 58 bytes (Eth + IPv4 + TCP base + 4 bytes options)
 #   second mbuf: 8 bytes (remaining options)
-# Expected: fast_dispatch=1, packets_processed=1 (no double counting)
+# Expected: fast_dispatch=1 AND pullup_count=1 (proves fallback to safe path)
 if [ "$DEBUG_STATS_ENABLED" = "1" ]; then
 	run_inject_test "inject_fragmented" "{ mss=1460 ipv6=0 split_offset=58 csum_flags=0 ext_type=0 }" 1 1 "m_len=58, TCP options split: fast→safe fallback" "fast_dispatch_count" 1
+
+	# Verify that pullup was called (proves safe path fallback occurred)
+	STATS=$(ngctl msg mbuf_test_mss: getstats 2>&1)
+	PULLUP_COUNT=$(echo "$STATS" | grep -o 'pullup_count=[0-9]*' | cut -d= -f2)
+	[ -z "$PULLUP_COUNT" ] && PULLUP_COUNT=0
+
+	if [ "$PULLUP_COUNT" != "1" ]; then
+		fail_test "Fast→safe fallback: pullup_count=$PULLUP_COUNT (expected 1, proving safe path executed)"
+	else
+		echo "  ✓ Verified: pullup_count=1 (safe path fallback confirmed)"
+	fi
 else
 	run_inject_test "inject_fragmented" "{ mss=1460 ipv6=0 split_offset=58 csum_flags=0 ext_type=0 }" 1 1 "m_len=58, TCP options split: fast→safe fallback"
 fi
 
 # Note: This test validates the core design change - entry at 58 is safe
-# even when TCP options require safe path processing
+# even when TCP options require safe path processing. The pullup_count
+# proves that the safe path was actually executed after fast path entry.
 
 echo ""
 echo "=========================================="
@@ -479,6 +491,7 @@ echo ""
 # MSS option starts at byte 56 (14 + 20 + 20 + 2)
 
 # Test: Split at MSS option kind byte (byte 56)
+# This is the most challenging case - MSS option header itself is fragmented
 if [ "$DEBUG_STATS_ENABLED" = "1" ]; then
 	run_inject_test "inject_fragmented" "{ mss=1460 ipv6=0 split_offset=56 csum_flags=0 ext_type=0 }" 1 1 "MSS split: kind at boundary (offset 56)" "safe_dispatch_count" 1
 else
@@ -486,6 +499,7 @@ else
 fi
 
 # Test: Split at MSS option length byte (byte 57)
+# MSS kind is in first mbuf, but length and value are in second mbuf
 if [ "$DEBUG_STATS_ENABLED" = "1" ]; then
 	run_inject_test "inject_fragmented" "{ mss=1460 ipv6=0 split_offset=57 csum_flags=0 ext_type=0 }" 1 1 "MSS split: length at boundary (offset 57)" "safe_dispatch_count" 1
 else
@@ -493,6 +507,8 @@ else
 fi
 
 # Test: Split at MSS value high byte (byte 58)
+# MSS kind+len in first mbuf, both value bytes in second mbuf
+# Note: Also tested in Test 8 for fallback validation (different focus)
 if [ "$DEBUG_STATS_ENABLED" = "1" ]; then
 	run_inject_test "inject_fragmented" "{ mss=1460 ipv6=0 split_offset=58 csum_flags=0 ext_type=0 }" 1 1 "MSS split: value[0] at boundary (offset 58)" "fast_dispatch_count" 1
 else
@@ -500,6 +516,8 @@ else
 fi
 
 # Test: Split at MSS value low byte (byte 59)
+# This is critical: 16-bit MSS value itself spans mbuf boundary
+# MSS kind+len+value[0] in first mbuf, value[1] in second mbuf
 if [ "$DEBUG_STATS_ENABLED" = "1" ]; then
 	run_inject_test "inject_fragmented" "{ mss=1460 ipv6=0 split_offset=59 csum_flags=0 ext_type=0 }" 1 1 "MSS split: value[1] at boundary (offset 59)" "fast_dispatch_count" 1
 else
@@ -507,8 +525,9 @@ else
 fi
 
 echo ""
-echo "Note: These tests validate that m_copydata() correctly handles"
-echo "MSS option parsing even when the option spans multiple mbufs."
+echo "Note: These tests validate m_copydata() robustness across all MSS option"
+echo "boundary cases: kind/length bytes (56/57), and MSS value fragmentation (58/59)."
+echo "Test 8 uses offset=58 to prove fast→safe fallback; Test 9 ensures correctness."
 
 echo ""
 echo "=========================================="
