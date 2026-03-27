@@ -78,13 +78,13 @@ Kernel Stack
 The module uses two distinct code paths for performance:
 
 **Fast Path** (`ng_mss_rewrite_process_fast`):
-- Triggered when `m->m_len >= 66` bytes (Ether + IP + TCP + options contiguous)
+- Triggered when `m->m_len >= 58` bytes (Ether + IP + TCP + options contiguous)
 - Direct pointer arithmetic for header access
 - No mbuf manipulation unless MSS rewrite is needed
 - Most packets take this path
 
 **Safe Path** (`ng_mss_rewrite_process_safe`):
-- Triggered when `m->m_len < 66` bytes (fragmented mbuf chain)
+- Triggered when `m->m_len < 58` bytes (fragmented mbuf chain)
 - Uses `m_copydata()` to safely read headers across mbuf boundaries
 - Calls `m_pullup()` only when actually rewriting MSS
 - Handles edge cases: fragmented chains, small packets

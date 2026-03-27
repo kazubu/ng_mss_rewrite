@@ -147,8 +147,31 @@ ngctl msg mss0: getstats
 Output:
 ```
 Rec'd response "getstats" (4) from "mss0:":
-Args:   { packets_processed=12345 packets_rewritten=678 }
+Args:   { packets_processed=12345 packets_rewritten=678
+          drop_pullup_failed=0 drop_unshare_failed=0 skip_fragmented_ipv4=0 }
 ```
+
+**Statistics fields:**
+
+**Basic Counters:**
+- `packets_processed`: Number of TCP SYN packets processed (attempted MSS rewrite)
+- `packets_rewritten`: Number of packets where MSS was actually rewritten
+
+**Permanent Counters (Production Observability):**
+
+These counters are always collected (even when `stats_mode=DISABLED`) to provide essential observability for production debugging.
+
+**Drop Counters (Critical - packets lost):**
+- `drop_pullup_failed`: Packets dropped due to `m_pullup()` failure (memory exhaustion)
+- `drop_unshare_failed`: Packets dropped due to `m_unshare()` failure (memory exhaustion)
+
+**Skip Counters (Informational):**
+- `skip_fragmented_ipv4`: IPv4 fragmented packets skipped (documented limitation)
+
+**Important Notes:**
+- Drop counters should normally be zero. Non-zero values indicate memory pressure.
+- The skip counter is informational and tracks IPv4 fragmented packets (rare in SYN packets).
+- These permanent counters have minimal overhead (~1% vs packets_processed/rewritten).
 
 ### Reset Statistics
 

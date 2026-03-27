@@ -75,6 +75,10 @@
 struct ng_mss_stats_percpu {
 	uint64_t	packets_processed;
 	uint64_t	packets_rewritten;
+	/* Permanent counters (always collected, regardless of stats_mode) */
+	uint64_t	drop_pullup_failed;	/* m_pullup() failed (packet dropped) */
+	uint64_t	drop_unshare_failed;	/* m_unshare() failed (packet dropped) */
+	uint64_t	skip_fragmented_ipv4;	/* IPv4 fragmented packets (limitation) */
 #if ENABLE_DEBUG_STATS
 	/* Code path dispatch tracking (entry point decision) */
 	uint64_t	fast_dispatch_count;
@@ -83,7 +87,9 @@ struct ng_mss_stats_percpu {
 	uint64_t	pullup_failed;
 	uint64_t	unshare_count;
 	uint64_t	unshare_failed;
-	/* Skip reasons (only implemented counters) */
+	/* Skip reasons (debug only) */
+	uint64_t	skip_non_tcp;		/* Non-TCP packets (UDP, ICMP, etc.) */
+	uint64_t	skip_ipv6_non_tcp;		/* IPv6 non-TCP (extension headers and other protocols) */
 	uint64_t	skip_offload;
 	uint64_t	skip_no_mss;
 	uint64_t	skip_mss_ok;
@@ -106,6 +112,9 @@ struct ng_mss_rewrite_private {
 	/* Baseline for resetstats (snapshot at last reset) */
 	uint64_t	baseline_processed;
 	uint64_t	baseline_rewritten;
+	uint64_t	baseline_drop_pullup_failed;
+	uint64_t	baseline_drop_unshare_failed;
+	uint64_t	baseline_skip_fragmented_ipv4;
 #if ENABLE_DEBUG_STATS
 	uint64_t	baseline_fast_dispatch_count;
 	uint64_t	baseline_safe_dispatch_count;
@@ -113,6 +122,8 @@ struct ng_mss_rewrite_private {
 	uint64_t	baseline_pullup_failed;
 	uint64_t	baseline_unshare_count;
 	uint64_t	baseline_unshare_failed;
+	uint64_t	baseline_skip_non_tcp;
+	uint64_t	baseline_skip_ipv6_non_tcp;
 	uint64_t	baseline_skip_offload;
 	uint64_t	baseline_skip_no_mss;
 	uint64_t	baseline_skip_mss_ok;
@@ -144,6 +155,10 @@ struct ng_mss_rewrite_conf {
 struct ng_mss_rewrite_stats {
 	uint64_t	packets_processed;
 	uint64_t	packets_rewritten;
+	/* Permanent counters (always visible) */
+	uint64_t	drop_pullup_failed;
+	uint64_t	drop_unshare_failed;
+	uint64_t	skip_fragmented_ipv4;
 #if ENABLE_DEBUG_STATS
 	/* Code path dispatch tracking (entry point decision) */
 	uint64_t	fast_dispatch_count;
@@ -152,7 +167,9 @@ struct ng_mss_rewrite_stats {
 	uint64_t	pullup_failed;
 	uint64_t	unshare_count;
 	uint64_t	unshare_failed;
-	/* Skip reasons (only implemented counters) */
+	/* Skip reasons (debug only) */
+	uint64_t	skip_non_tcp;
+	uint64_t	skip_ipv6_non_tcp;
 	uint64_t	skip_offload;
 	uint64_t	skip_no_mss;
 	uint64_t	skip_mss_ok;
@@ -183,6 +200,9 @@ static const struct ng_parse_type ng_mss_rewrite_conf_type = {
 static const struct ng_parse_struct_field ng_mss_rewrite_stats_fields[] = {
 	{ "packets_processed",	&ng_parse_uint64_type },
 	{ "packets_rewritten",	&ng_parse_uint64_type },
+	{ "drop_pullup_failed",	&ng_parse_uint64_type },
+	{ "drop_unshare_failed",	&ng_parse_uint64_type },
+	{ "skip_fragmented_ipv4",	&ng_parse_uint64_type },
 #if ENABLE_DEBUG_STATS
 	{ "fast_dispatch_count",	&ng_parse_uint64_type },
 	{ "safe_dispatch_count",	&ng_parse_uint64_type },
@@ -190,6 +210,8 @@ static const struct ng_parse_struct_field ng_mss_rewrite_stats_fields[] = {
 	{ "pullup_failed",	&ng_parse_uint64_type },
 	{ "unshare_count",	&ng_parse_uint64_type },
 	{ "unshare_failed",	&ng_parse_uint64_type },
+	{ "skip_non_tcp",	&ng_parse_uint64_type },
+	{ "skip_ipv6_non_tcp",	&ng_parse_uint64_type },
 	{ "skip_offload",	&ng_parse_uint64_type },
 	{ "skip_no_mss",	&ng_parse_uint64_type },
 	{ "skip_mss_ok",	&ng_parse_uint64_type },
@@ -453,10 +475,23 @@ ng_mss_rewrite_process_fast(priv_p priv, struct mbuf *m, int from_upper)
 		if (ip_hlen > (int)sizeof(struct ip) && m->m_len < offset + ip_hlen)
 			return ng_mss_rewrite_process_safe(priv, m, from_upper, 1);
 
-		if (ip4->ip_p != IPPROTO_TCP)
+		if (ip4->ip_p != IPPROTO_TCP) {
+#if ENABLE_DEBUG_STATS
+			/* Debug counter: non-TCP packet */
+			{
+				uint8_t stats_mode = atomic_load_acq_8(&priv->stats_mode);
+				if (stats_mode == STATS_MODE_PERCPU)
+					priv->stats_percpu[curcpu].skip_non_tcp++;
+			}
+#endif
 			return (m);
-		if (ntohs(ip4->ip_off) & (IP_MF | IP_OFFMASK))
+		}
+		if (ntohs(ip4->ip_off) & (IP_MF | IP_OFFMASK)) {
+			/* Permanent counter: fragmented IPv4 (always incremented) */
+			if (priv->stats_percpu != NULL)
+				priv->stats_percpu[curcpu].skip_fragmented_ipv4++;
 			return (m);
+		}
 
 		plen = ntohs(ip4->ip_len);
 		if (plen < ip_hlen + (int)sizeof(struct tcphdr) || plen > m->m_pkthdr.len - offset)
@@ -478,8 +513,17 @@ ng_mss_rewrite_process_fast(priv_p priv, struct mbuf *m, int from_upper)
 		ip6 = (struct ip6_hdr *)(pkt + offset);
 		ip_hlen = sizeof(struct ip6_hdr);
 
-		if (ip6->ip6_nxt != IPPROTO_TCP)
+		if (ip6->ip6_nxt != IPPROTO_TCP) {
+#if ENABLE_DEBUG_STATS
+			/* Debug counter: IPv6 non-TCP (includes extension headers and other protocols) */
+			{
+				uint8_t stats_mode = atomic_load_acq_8(&priv->stats_mode);
+				if (stats_mode == STATS_MODE_PERCPU)
+					priv->stats_percpu[curcpu].skip_ipv6_non_tcp++;
+			}
+#endif
 			return (m);
+		}
 
 		plen = ntohs(ip6->ip6_plen);
 		if (plen < (int)sizeof(struct tcphdr) || plen > m->m_pkthdr.len - offset - ip_hlen)
@@ -609,6 +653,9 @@ ng_mss_rewrite_process_fast(priv_p priv, struct mbuf *m, int from_upper)
 #endif
 		m = m_unshare(m, M_NOWAIT);
 		if (m == NULL) {
+			/* Permanent counter: packet dropped (always incremented) */
+			if (priv->stats_percpu != NULL)
+				priv->stats_percpu[curcpu].drop_unshare_failed++;
 #if ENABLE_DEBUG_STATS
 			if (st != NULL)
 				st->unshare_failed++;
@@ -697,12 +744,25 @@ ng_mss_rewrite_process_safe(priv_p priv, struct mbuf *m, int from_upper, int fro
 		m_copydata(m, offset, sizeof(struct ip), (caddr_t)&ip4);
 
 		/* Fast path: not TCP */
-		if (ip4.ip_p != IPPROTO_TCP)
+		if (ip4.ip_p != IPPROTO_TCP) {
+#if ENABLE_DEBUG_STATS
+			/* Debug counter: non-TCP packet */
+			{
+				uint8_t stats_mode = atomic_load_acq_8(&priv->stats_mode);
+				if (stats_mode == STATS_MODE_PERCPU)
+					priv->stats_percpu[curcpu].skip_non_tcp++;
+			}
+#endif
 			return (m);
+		}
 
 		/* Skip fragmented packets (only first fragment has TCP header) */
-		if (ntohs(ip4.ip_off) & (IP_MF | IP_OFFMASK))
+		if (ntohs(ip4.ip_off) & (IP_MF | IP_OFFMASK)) {
+			/* Permanent counter: fragmented IPv4 (always incremented) */
+			if (priv->stats_percpu != NULL)
+				priv->stats_percpu[curcpu].skip_fragmented_ipv4++;
 			return (m);
+		}
 
 		/* Verify minimum packet length for TCP */
 		plen = ntohs(ip4.ip_len);
@@ -726,8 +786,17 @@ ng_mss_rewrite_process_safe(priv_p priv, struct mbuf *m, int from_upper, int fro
 		ip_hlen = sizeof(struct ip6_hdr);
 
 		/* Fast path: not TCP (simplified, not handling extension headers) */
-		if (ip6.ip6_nxt != IPPROTO_TCP)
+		if (ip6.ip6_nxt != IPPROTO_TCP) {
+#if ENABLE_DEBUG_STATS
+			/* Debug counter: IPv6 non-TCP (includes extension headers and other protocols) */
+			{
+				uint8_t stats_mode = atomic_load_acq_8(&priv->stats_mode);
+				if (stats_mode == STATS_MODE_PERCPU)
+					priv->stats_percpu[curcpu].skip_ipv6_non_tcp++;
+			}
+#endif
 			return (m);
+		}
 
 		/* Verify payload length is valid for a TCP header */
 		plen = ntohs(ip6.ip6_plen);
@@ -902,6 +971,9 @@ found_mss:
 #endif
 		m = m_pullup(m, offset + tcp_hlen);
 		if (m == NULL) {
+			/* Permanent counter: packet dropped (always incremented) */
+			if (priv->stats_percpu != NULL)
+				priv->stats_percpu[curcpu].drop_pullup_failed++;
 #if ENABLE_DEBUG_STATS
 			if (st != NULL)
 				st->pullup_failed++;
@@ -918,6 +990,9 @@ found_mss:
 #endif
 		m = m_unshare(m, M_NOWAIT);
 		if (m == NULL) {
+			/* Permanent counter: packet dropped (always incremented) */
+			if (priv->stats_percpu != NULL)
+				priv->stats_percpu[curcpu].drop_unshare_failed++;
 #if ENABLE_DEBUG_STATS
 			if (st != NULL)
 				st->unshare_failed++;
@@ -1107,6 +1182,9 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 			/* Aggregate per-CPU counters */
 			stats->packets_processed = 0;
 			stats->packets_rewritten = 0;
+			stats->drop_pullup_failed = 0;
+			stats->drop_unshare_failed = 0;
+			stats->skip_fragmented_ipv4 = 0;
 #if ENABLE_DEBUG_STATS
 			stats->fast_dispatch_count = 0;
 			stats->safe_dispatch_count = 0;
@@ -1114,6 +1192,8 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 			stats->pullup_failed = 0;
 			stats->unshare_count = 0;
 			stats->unshare_failed = 0;
+			stats->skip_non_tcp = 0;
+			stats->skip_ipv6_non_tcp = 0;
 			stats->skip_offload = 0;
 			stats->skip_no_mss = 0;
 			stats->skip_mss_ok = 0;
@@ -1124,6 +1204,9 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 				for (cpu = 0; cpu < mp_ncpus; cpu++) {
 					stats->packets_processed += priv->stats_percpu[cpu].packets_processed;
 					stats->packets_rewritten += priv->stats_percpu[cpu].packets_rewritten;
+					stats->drop_pullup_failed += priv->stats_percpu[cpu].drop_pullup_failed;
+					stats->drop_unshare_failed += priv->stats_percpu[cpu].drop_unshare_failed;
+					stats->skip_fragmented_ipv4 += priv->stats_percpu[cpu].skip_fragmented_ipv4;
 #if ENABLE_DEBUG_STATS
 					stats->fast_dispatch_count += priv->stats_percpu[cpu].fast_dispatch_count;
 					stats->safe_dispatch_count += priv->stats_percpu[cpu].safe_dispatch_count;
@@ -1131,6 +1214,8 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 					stats->pullup_failed += priv->stats_percpu[cpu].pullup_failed;
 					stats->unshare_count += priv->stats_percpu[cpu].unshare_count;
 					stats->unshare_failed += priv->stats_percpu[cpu].unshare_failed;
+					stats->skip_non_tcp += priv->stats_percpu[cpu].skip_non_tcp;
+					stats->skip_ipv6_non_tcp += priv->stats_percpu[cpu].skip_ipv6_non_tcp;
 					stats->skip_offload += priv->stats_percpu[cpu].skip_offload;
 					stats->skip_no_mss += priv->stats_percpu[cpu].skip_no_mss;
 					stats->skip_mss_ok += priv->stats_percpu[cpu].skip_mss_ok;
@@ -1141,6 +1226,9 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 			/* Subtract baseline (for resetstats support) */
 			stats->packets_processed -= priv->baseline_processed;
 			stats->packets_rewritten -= priv->baseline_rewritten;
+			stats->drop_pullup_failed -= priv->baseline_drop_pullup_failed;
+			stats->drop_unshare_failed -= priv->baseline_drop_unshare_failed;
+			stats->skip_fragmented_ipv4 -= priv->baseline_skip_fragmented_ipv4;
 #if ENABLE_DEBUG_STATS
 			stats->fast_dispatch_count -= priv->baseline_fast_dispatch_count;
 			stats->safe_dispatch_count -= priv->baseline_safe_dispatch_count;
@@ -1148,6 +1236,8 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 			stats->pullup_failed -= priv->baseline_pullup_failed;
 			stats->unshare_count -= priv->baseline_unshare_count;
 			stats->unshare_failed -= priv->baseline_unshare_failed;
+			stats->skip_non_tcp -= priv->baseline_skip_non_tcp;
+			stats->skip_ipv6_non_tcp -= priv->baseline_skip_ipv6_non_tcp;
 			stats->skip_offload -= priv->baseline_skip_offload;
 			stats->skip_no_mss -= priv->baseline_skip_no_mss;
 			stats->skip_mss_ok -= priv->baseline_skip_mss_ok;
@@ -1166,10 +1256,13 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 		{
 			/* Baseline method: snapshot current total, don't zero live counters */
 			uint64_t total_processed = 0, total_rewritten = 0;
+			uint64_t total_drop_pullup_failed = 0, total_drop_unshare_failed = 0;
+			uint64_t total_skip_fragmented_ipv4 = 0;
 #if ENABLE_DEBUG_STATS
 			uint64_t total_fast_path = 0, total_safe_path = 0;
 			uint64_t total_pullup = 0, total_pullup_failed = 0;
 			uint64_t total_unshare = 0, total_unshare_failed = 0;
+			uint64_t total_skip_non_tcp = 0, total_skip_ipv6_non_tcp = 0;
 			uint64_t total_skip_offload = 0;
 			uint64_t total_skip_no_mss = 0, total_skip_mss_ok = 0;
 #endif
@@ -1182,6 +1275,9 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 				for (cpu = 0; cpu < mp_ncpus; cpu++) {
 					total_processed += priv->stats_percpu[cpu].packets_processed;
 					total_rewritten += priv->stats_percpu[cpu].packets_rewritten;
+					total_drop_pullup_failed += priv->stats_percpu[cpu].drop_pullup_failed;
+					total_drop_unshare_failed += priv->stats_percpu[cpu].drop_unshare_failed;
+					total_skip_fragmented_ipv4 += priv->stats_percpu[cpu].skip_fragmented_ipv4;
 #if ENABLE_DEBUG_STATS
 					total_fast_path += priv->stats_percpu[cpu].fast_dispatch_count;
 					total_safe_path += priv->stats_percpu[cpu].safe_dispatch_count;
@@ -1189,6 +1285,8 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 					total_pullup_failed += priv->stats_percpu[cpu].pullup_failed;
 					total_unshare += priv->stats_percpu[cpu].unshare_count;
 					total_unshare_failed += priv->stats_percpu[cpu].unshare_failed;
+					total_skip_non_tcp += priv->stats_percpu[cpu].skip_non_tcp;
+					total_skip_ipv6_non_tcp += priv->stats_percpu[cpu].skip_ipv6_non_tcp;
 					total_skip_offload += priv->stats_percpu[cpu].skip_offload;
 					total_skip_no_mss += priv->stats_percpu[cpu].skip_no_mss;
 					total_skip_mss_ok += priv->stats_percpu[cpu].skip_mss_ok;
@@ -1198,6 +1296,9 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 
 			priv->baseline_processed = total_processed;
 			priv->baseline_rewritten = total_rewritten;
+			priv->baseline_drop_pullup_failed = total_drop_pullup_failed;
+			priv->baseline_drop_unshare_failed = total_drop_unshare_failed;
+			priv->baseline_skip_fragmented_ipv4 = total_skip_fragmented_ipv4;
 #if ENABLE_DEBUG_STATS
 			priv->baseline_fast_dispatch_count = total_fast_path;
 			priv->baseline_safe_dispatch_count = total_safe_path;
@@ -1205,6 +1306,8 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 			priv->baseline_pullup_failed = total_pullup_failed;
 			priv->baseline_unshare_count = total_unshare;
 			priv->baseline_unshare_failed = total_unshare_failed;
+			priv->baseline_skip_non_tcp = total_skip_non_tcp;
+			priv->baseline_skip_ipv6_non_tcp = total_skip_ipv6_non_tcp;
 			priv->baseline_skip_offload = total_skip_offload;
 			priv->baseline_skip_no_mss = total_skip_no_mss;
 			priv->baseline_skip_mss_ok = total_skip_mss_ok;

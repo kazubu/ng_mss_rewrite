@@ -128,24 +128,10 @@ run_inject_test() {
 	# Display raw statistics for this test
 	echo "  Stats: processed=$PROCESSED rewritten=$REWRITTEN"
 	if [ "$DEBUG_STATS_ENABLED" = "1" ]; then
-		# Extract and display debug counters
-		FAST_PATH=$(echo "$STATS" | grep -o 'fast_dispatch_count=[0-9]*' | cut -d= -f2)
-		SAFE_PATH=$(echo "$STATS" | grep -o 'safe_dispatch_count=[0-9]*' | cut -d= -f2)
-		PULLUP=$(echo "$STATS" | grep -o 'pullup_count=[0-9]*' | cut -d= -f2)
-		UNSHARE=$(echo "$STATS" | grep -o 'unshare_count=[0-9]*' | cut -d= -f2)
-		SKIP_OFFLOAD=$(echo "$STATS" | grep -o 'skip_offload=[0-9]*' | cut -d= -f2)
-		SKIP_MSS_OK=$(echo "$STATS" | grep -o 'skip_mss_ok=[0-9]*' | cut -d= -f2)
-		SKIP_NO_MSS=$(echo "$STATS" | grep -o 'skip_no_mss=[0-9]*' | cut -d= -f2)
+		# Display all debug counters
+		STATS_VALUE=$(echo "$STATS" | grep -o '{.*}')
 
-		[ -z "$FAST_PATH" ] && FAST_PATH=0
-		[ -z "$SAFE_PATH" ] && SAFE_PATH=0
-		[ -z "$PULLUP" ] && PULLUP=0
-		[ -z "$UNSHARE" ] && UNSHARE=0
-		[ -z "$SKIP_OFFLOAD" ] && SKIP_OFFLOAD=0
-		[ -z "$SKIP_MSS_OK" ] && SKIP_MSS_OK=0
-		[ -z "$SKIP_NO_MSS" ] && SKIP_NO_MSS=0
-
-		echo "  Debug: fast=$FAST_PATH safe=$SAFE_PATH pullup=$PULLUP unshare=$UNSHARE skip_offload=$SKIP_OFFLOAD skip_mss_ok=$SKIP_MSS_OK skip_no_mss=$SKIP_NO_MSS"
+		echo "  Debug: $STATS_VALUE"
 	fi
 
 	# Check basic counters
