@@ -21,6 +21,7 @@ FreeBSD netgraph node for rewriting TCP MSS (Maximum Segment Size) option in SYN
   - **Disabled**: Zero overhead (default)
   - **Per-CPU**: Minimal overhead (~1-2%)
   - Runtime switchable without data loss
+  - Uses FreeBSD counter(9) API for efficient per-CPU counting
 - **Safe mbuf handling:**
   - Uses `m_copydata()` for header parsing (handles fragmented mbuf chains)
   - Only modifies mbuf when rewrite is actually needed
@@ -260,9 +261,13 @@ ngctl msg mss0: setstatsmode "{ mode=1 }"
 - **DISABLED (0)**: Zero overhead (default)
 - **PERCPU (1)**: Minimal overhead (~1-2%)
 
-**Important Notes:**
+**Implementation Details:**
+- Uses FreeBSD standard counter(9) API for per-CPU counting
+- counter_u64_t provides lock-free atomic increments across all CPUs
+- Counters allocated once at node creation, freed at shutdown
 - Switching modes does NOT reset counters (baseline method)
-- Per-CPU array allocated once, never freed until node shutdown
+
+**Important Notes:**
 - Safe to switch modes at any time during operation
 - Use DISABLED mode in production for maximum performance
 

@@ -15,6 +15,7 @@
 #include <sys/smp.h>
 #include <sys/pcpu.h>
 #include <sys/mutex.h>
+#include <sys/counter.h>
 #include <machine/atomic.h>
 
 #include <net/if.h>
@@ -71,31 +72,6 @@
 #define ENABLE_DEBUG_STATS	0
 #endif
 
-/* Per-CPU statistics structure */
-struct ng_mss_stats_percpu {
-	uint64_t	packets_processed;
-	uint64_t	packets_rewritten;
-	/* Permanent counters (always collected, regardless of stats_mode) */
-	uint64_t	drop_pullup_failed;	/* m_pullup() failed (packet dropped) */
-	uint64_t	drop_unshare_failed;	/* m_unshare() failed (packet dropped) */
-	uint64_t	skip_fragmented_ipv4;	/* IPv4 fragmented packets (limitation) */
-#if ENABLE_DEBUG_STATS
-	/* Code path dispatch tracking (entry point decision) */
-	uint64_t	fast_dispatch_count;
-	uint64_t	safe_dispatch_count;
-	uint64_t	pullup_count;
-	uint64_t	pullup_failed;
-	uint64_t	unshare_count;
-	uint64_t	unshare_failed;
-	/* Skip reasons (debug only) */
-	uint64_t	skip_non_tcp;		/* Non-TCP packets (UDP, ICMP, etc.) */
-	uint64_t	skip_ipv6_non_tcp;		/* IPv6 non-TCP (extension headers and other protocols) */
-	uint64_t	skip_offload;
-	uint64_t	skip_no_mss;
-	uint64_t	skip_mss_ok;
-#endif
-} __aligned(CACHE_LINE_SIZE);
-
 /* Private node data */
 struct ng_mss_rewrite_private {
 	hook_p		lower;		/* Connection to physical interface */
@@ -106,8 +82,29 @@ struct ng_mss_rewrite_private {
 	uint8_t		enable_lower;	/* Enable processing from lower hook (atomic access) */
 	uint8_t		enable_upper;	/* Enable processing from upper hook (atomic access) */
 
-	/* Per-CPU statistics (allocated once, never freed until shutdown) */
-	struct ng_mss_stats_percpu *stats_percpu;
+#if ENABLE_STATS
+	/* Per-CPU counters using counter(9) API */
+	counter_u64_t	packets_processed;
+	counter_u64_t	packets_rewritten;
+	/* Permanent counters (always collected, regardless of stats_mode) */
+	counter_u64_t	drop_pullup_failed;	/* m_pullup() failed (packet dropped) */
+	counter_u64_t	drop_unshare_failed;	/* m_unshare() failed (packet dropped) */
+	counter_u64_t	skip_fragmented_ipv4;	/* IPv4 fragmented packets (limitation) */
+#if ENABLE_DEBUG_STATS
+	/* Code path dispatch tracking (entry point decision) */
+	counter_u64_t	fast_dispatch_count;
+	counter_u64_t	safe_dispatch_count;
+	counter_u64_t	pullup_count;
+	counter_u64_t	pullup_failed;
+	counter_u64_t	unshare_count;
+	counter_u64_t	unshare_failed;
+	/* Skip reasons (debug only) */
+	counter_u64_t	skip_non_tcp;		/* Non-TCP packets (UDP, ICMP, etc.) */
+	counter_u64_t	skip_ipv6_non_tcp;	/* IPv6 non-TCP (extension headers and other protocols) */
+	counter_u64_t	skip_offload;
+	counter_u64_t	skip_no_mss;
+	counter_u64_t	skip_mss_ok;
+#endif
 
 	/* Baseline for resetstats (snapshot at last reset) */
 	uint64_t	baseline_processed;
@@ -131,6 +128,7 @@ struct ng_mss_rewrite_private {
 
 	/* Mutex for getstats/resetstats mutual exclusion */
 	struct mtx	stats_mtx;
+#endif /* ENABLE_STATS */
 };
 typedef struct ng_mss_rewrite_private *priv_p;
 
@@ -383,30 +381,24 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m, int from_upper)
 	 */
 	if (m->m_len >= NG_MSS_FAST_PATH_MIN_LEN) {
 		/* Fast path: m_len >= 58, try direct pointer access */
-#if ENABLE_DEBUG_STATS
-		{
-			/*
-			 * Track fast path entry (not final execution path).
-			 * May still fall back to safe path for IP/TCP options.
-			 */
-			uint8_t stats_mode = atomic_load_acq_8(&priv->stats_mode);
-			if (stats_mode == STATS_MODE_PERCPU)
-				priv->stats_percpu[curcpu].fast_dispatch_count++;
-		}
+#if ENABLE_STATS && ENABLE_DEBUG_STATS
+		/*
+		 * Track fast path entry (not final execution path).
+		 * May still fall back to safe path for IP/TCP options.
+		 */
+		if (atomic_load_acq_8(&priv->stats_mode) == STATS_MODE_PERCPU)
+			counter_u64_add(priv->fast_dispatch_count, 1);
 #endif
 		return ng_mss_rewrite_process_fast(priv, m, from_upper);
 	} else {
 		/* Safe path: m_len < 58, use m_copydata() from start */
-#if ENABLE_DEBUG_STATS
-		{
-			/*
-			 * Track safe path direct entry.
-			 * Does not count fallbacks from fast path.
-			 */
-			uint8_t stats_mode = atomic_load_acq_8(&priv->stats_mode);
-			if (stats_mode == STATS_MODE_PERCPU)
-				priv->stats_percpu[curcpu].safe_dispatch_count++;
-		}
+#if ENABLE_STATS && ENABLE_DEBUG_STATS
+		/*
+		 * Track safe path direct entry.
+		 * Does not count fallbacks from fast path.
+		 */
+		if (atomic_load_acq_8(&priv->stats_mode) == STATS_MODE_PERCPU)
+			counter_u64_add(priv->safe_dispatch_count, 1);
 #endif
 		return ng_mss_rewrite_process_safe(priv, m, from_upper, 0);
 	}
@@ -428,11 +420,6 @@ ng_mss_rewrite_process_fast(priv_p priv, struct mbuf *m, int from_upper)
 	uint8_t *options, *pkt;
 	uint16_t ether_type, max_mss, old_mss, plen;
 	int offset, ip_hlen, tcp_hlen, opt_len, mss_offset, i;
-
-#if ENABLE_STATS
-	uint8_t stats_mode;
-	struct ng_mss_stats_percpu *st = NULL;
-#endif
 
 	/* Fast path: ensure minimum packet length */
 	if (m->m_pkthdr.len < sizeof(struct ether_header) + sizeof(struct ip) + sizeof(struct tcphdr))
@@ -476,20 +463,18 @@ ng_mss_rewrite_process_fast(priv_p priv, struct mbuf *m, int from_upper)
 			return ng_mss_rewrite_process_safe(priv, m, from_upper, 1);
 
 		if (ip4->ip_p != IPPROTO_TCP) {
-#if ENABLE_DEBUG_STATS
+#if ENABLE_STATS && ENABLE_DEBUG_STATS
 			/* Debug counter: non-TCP packet */
-			{
-				uint8_t stats_mode = atomic_load_acq_8(&priv->stats_mode);
-				if (stats_mode == STATS_MODE_PERCPU)
-					priv->stats_percpu[curcpu].skip_non_tcp++;
-			}
+			if (atomic_load_acq_8(&priv->stats_mode) == STATS_MODE_PERCPU)
+				counter_u64_add(priv->skip_non_tcp, 1);
 #endif
 			return (m);
 		}
 		if (ntohs(ip4->ip_off) & (IP_MF | IP_OFFMASK)) {
+#if ENABLE_STATS
 			/* Permanent counter: fragmented IPv4 (always incremented) */
-			if (priv->stats_percpu != NULL)
-				priv->stats_percpu[curcpu].skip_fragmented_ipv4++;
+			counter_u64_add(priv->skip_fragmented_ipv4, 1);
+#endif
 			return (m);
 		}
 
@@ -514,13 +499,10 @@ ng_mss_rewrite_process_fast(priv_p priv, struct mbuf *m, int from_upper)
 		ip_hlen = sizeof(struct ip6_hdr);
 
 		if (ip6->ip6_nxt != IPPROTO_TCP) {
-#if ENABLE_DEBUG_STATS
+#if ENABLE_STATS && ENABLE_DEBUG_STATS
 			/* Debug counter: IPv6 non-TCP (includes extension headers and other protocols) */
-			{
-				uint8_t stats_mode = atomic_load_acq_8(&priv->stats_mode);
-				if (stats_mode == STATS_MODE_PERCPU)
-					priv->stats_percpu[curcpu].skip_ipv6_non_tcp++;
-			}
+			if (atomic_load_acq_8(&priv->stats_mode) == STATS_MODE_PERCPU)
+				counter_u64_add(priv->skip_ipv6_non_tcp, 1);
 #endif
 			return (m);
 		}
@@ -567,11 +549,8 @@ ng_mss_rewrite_process_fast(priv_p priv, struct mbuf *m, int from_upper)
 		return (m);
 
 #if ENABLE_STATS
-	stats_mode = atomic_load_acq_8(&priv->stats_mode);
-	if (stats_mode == STATS_MODE_PERCPU)
-		st = &priv->stats_percpu[curcpu];
-	if (st != NULL)
-		st->packets_processed++;
+	if (atomic_load_acq_8(&priv->stats_mode) == STATS_MODE_PERCPU)
+		counter_u64_add(priv->packets_processed, 1);
 #endif
 
 	/* Fall back to safe path if TCP options extend beyond m_len */
@@ -620,45 +599,46 @@ ng_mss_rewrite_process_fast(priv_p priv, struct mbuf *m, int from_upper)
 	}
 
 	if (mss_offset < 0) {
-#if ENABLE_DEBUG_STATS
-		if (st != NULL)
-			st->skip_no_mss++;
+#if ENABLE_STATS && ENABLE_DEBUG_STATS
+		if (atomic_load_acq_8(&priv->stats_mode) == STATS_MODE_PERCPU)
+			counter_u64_add(priv->skip_no_mss, 1);
 #endif
 		return (m);
 	}
 
 	old_mss = (options[mss_offset + 2] << 8) | options[mss_offset + 3];
 	if (old_mss <= max_mss) {
-#if ENABLE_DEBUG_STATS
-		if (st != NULL)
-			st->skip_mss_ok++;
+#if ENABLE_STATS && ENABLE_DEBUG_STATS
+		if (atomic_load_acq_8(&priv->stats_mode) == STATS_MODE_PERCPU)
+			counter_u64_add(priv->skip_mss_ok, 1);
 #endif
 		return (m);
 	}
 
 	/* Checksum offload check for upper direction */
 	if (from_upper && (m->m_pkthdr.csum_flags & (CSUM_TCP | CSUM_TSO))) {
-#if ENABLE_DEBUG_STATS
-		if (st != NULL)
-			st->skip_offload++;
+#if ENABLE_STATS && ENABLE_DEBUG_STATS
+		if (atomic_load_acq_8(&priv->stats_mode) == STATS_MODE_PERCPU)
+			counter_u64_add(priv->skip_offload, 1);
 #endif
 		return (m);
 	}
 
 	/* Ensure writable */
 	if (M_WRITABLE(m) == 0) {
-#if ENABLE_DEBUG_STATS
-		if (st != NULL)
-			st->unshare_count++;
+#if ENABLE_STATS && ENABLE_DEBUG_STATS
+		if (atomic_load_acq_8(&priv->stats_mode) == STATS_MODE_PERCPU)
+			counter_u64_add(priv->unshare_count, 1);
 #endif
 		m = m_unshare(m, M_NOWAIT);
 		if (m == NULL) {
+#if ENABLE_STATS
 			/* Permanent counter: packet dropped (always incremented) */
-			if (priv->stats_percpu != NULL)
-				priv->stats_percpu[curcpu].drop_unshare_failed++;
+			counter_u64_add(priv->drop_unshare_failed, 1);
 #if ENABLE_DEBUG_STATS
-			if (st != NULL)
-				st->unshare_failed++;
+			if (atomic_load_acq_8(&priv->stats_mode) == STATS_MODE_PERCPU)
+				counter_u64_add(priv->unshare_failed, 1);
+#endif
 #endif
 			return (NULL);
 		}
@@ -674,8 +654,8 @@ ng_mss_rewrite_process_fast(priv_p priv, struct mbuf *m, int from_upper)
 	options[mss_offset + 3] = max_mss & 0xff;
 
 #if ENABLE_STATS
-	if (st != NULL)
-		st->packets_rewritten++;
+	if (atomic_load_acq_8(&priv->stats_mode) == STATS_MODE_PERCPU)
+		counter_u64_add(priv->packets_rewritten, 1);
 #endif
 
 	return (m);
@@ -698,11 +678,6 @@ ng_mss_rewrite_process_safe(priv_p priv, struct mbuf *m, int from_upper, int fro
 	uint16_t ether_type, max_mss, old_mss, plen;
 	int offset, ip_hlen, tcp_hlen, opt_len, mss_offset;
 	int i, is_ipv4;
-
-#if ENABLE_STATS
-	uint8_t stats_mode;
-	struct ng_mss_stats_percpu *st = NULL;
-#endif
 
 	/* Fast path: ensure minimum packet length */
 	if (m->m_pkthdr.len < sizeof(struct ether_header) + sizeof(struct ip) + sizeof(struct tcphdr))
@@ -745,22 +720,20 @@ ng_mss_rewrite_process_safe(priv_p priv, struct mbuf *m, int from_upper, int fro
 
 		/* Fast path: not TCP */
 		if (ip4.ip_p != IPPROTO_TCP) {
-#if ENABLE_DEBUG_STATS
+#if ENABLE_STATS && ENABLE_DEBUG_STATS
 			/* Debug counter: non-TCP packet */
-			{
-				uint8_t stats_mode = atomic_load_acq_8(&priv->stats_mode);
-				if (stats_mode == STATS_MODE_PERCPU)
-					priv->stats_percpu[curcpu].skip_non_tcp++;
-			}
+			if (atomic_load_acq_8(&priv->stats_mode) == STATS_MODE_PERCPU)
+				counter_u64_add(priv->skip_non_tcp, 1);
 #endif
 			return (m);
 		}
 
 		/* Skip fragmented packets (only first fragment has TCP header) */
 		if (ntohs(ip4.ip_off) & (IP_MF | IP_OFFMASK)) {
+#if ENABLE_STATS
 			/* Permanent counter: fragmented IPv4 (always incremented) */
-			if (priv->stats_percpu != NULL)
-				priv->stats_percpu[curcpu].skip_fragmented_ipv4++;
+			counter_u64_add(priv->skip_fragmented_ipv4, 1);
+#endif
 			return (m);
 		}
 
@@ -787,13 +760,10 @@ ng_mss_rewrite_process_safe(priv_p priv, struct mbuf *m, int from_upper, int fro
 
 		/* Fast path: not TCP (simplified, not handling extension headers) */
 		if (ip6.ip6_nxt != IPPROTO_TCP) {
-#if ENABLE_DEBUG_STATS
+#if ENABLE_STATS && ENABLE_DEBUG_STATS
 			/* Debug counter: IPv6 non-TCP (includes extension headers and other protocols) */
-			{
-				uint8_t stats_mode = atomic_load_acq_8(&priv->stats_mode);
-				if (stats_mode == STATS_MODE_PERCPU)
-					priv->stats_percpu[curcpu].skip_ipv6_non_tcp++;
-			}
+			if (atomic_load_acq_8(&priv->stats_mode) == STATS_MODE_PERCPU)
+				counter_u64_add(priv->skip_ipv6_non_tcp, 1);
 #endif
 			return (m);
 		}
@@ -849,17 +819,12 @@ ng_mss_rewrite_process_safe(priv_p priv, struct mbuf *m, int from_upper, int fro
 	}
 
 #if ENABLE_STATS
-	/* Snapshot stats mode and cache pointer */
-	stats_mode = atomic_load_acq_8(&priv->stats_mode);
-	if (stats_mode == STATS_MODE_PERCPU)
-		st = &priv->stats_percpu[curcpu];
-
 	/*
 	 * Increment SYN packets counter (if not disabled)
 	 * Skip if called as fallback from fast path (already counted)
 	 */
-	if (st != NULL && !from_fast_fallback)
-		st->packets_processed++;
+	if (!from_fast_fallback && atomic_load_acq_8(&priv->stats_mode) == STATS_MODE_PERCPU)
+		counter_u64_add(priv->packets_processed, 1);
 #endif
 
 	/* Parse TCP options safely */
@@ -922,9 +887,9 @@ ng_mss_rewrite_process_safe(priv_p priv, struct mbuf *m, int from_upper, int fro
 	}
 
 	/* MSS option not found */
-#if ENABLE_DEBUG_STATS
-	if (st != NULL)
-		st->skip_no_mss++;
+#if ENABLE_STATS && ENABLE_DEBUG_STATS
+	if (atomic_load_acq_8(&priv->stats_mode) == STATS_MODE_PERCPU)
+		counter_u64_add(priv->skip_no_mss, 1);
 #endif
 	return (m);
 
@@ -935,9 +900,9 @@ found_mss:
 	/* Check if rewrite is needed */
 	if (old_mss <= max_mss) {
 		/* MSS is already within limit, no rewrite needed */
-#if ENABLE_DEBUG_STATS
-		if (st != NULL)
-			st->skip_mss_ok++;
+#if ENABLE_STATS && ENABLE_DEBUG_STATS
+		if (atomic_load_acq_8(&priv->stats_mode) == STATS_MODE_PERCPU)
+			counter_u64_add(priv->skip_mss_ok, 1);
 #endif
 		return (m);
 	}
@@ -950,9 +915,9 @@ found_mss:
 	if (from_upper) {
 		if (m->m_pkthdr.csum_flags & (CSUM_TCP | CSUM_TSO)) {
 			/* Checksum offload active, skip rewrite */
-#if ENABLE_DEBUG_STATS
-			if (st != NULL)
-				st->skip_offload++;
+#if ENABLE_STATS && ENABLE_DEBUG_STATS
+			if (atomic_load_acq_8(&priv->stats_mode) == STATS_MODE_PERCPU)
+				counter_u64_add(priv->skip_offload, 1);
 #endif
 			return (m);
 		}
@@ -965,18 +930,19 @@ found_mss:
 
 	/* Ensure we have contiguous access to headers we need to modify */
 	if (m->m_len < offset + tcp_hlen) {
-#if ENABLE_DEBUG_STATS
-		if (st != NULL)
-			st->pullup_count++;
+#if ENABLE_STATS && ENABLE_DEBUG_STATS
+		if (atomic_load_acq_8(&priv->stats_mode) == STATS_MODE_PERCPU)
+			counter_u64_add(priv->pullup_count, 1);
 #endif
 		m = m_pullup(m, offset + tcp_hlen);
 		if (m == NULL) {
+#if ENABLE_STATS
 			/* Permanent counter: packet dropped (always incremented) */
-			if (priv->stats_percpu != NULL)
-				priv->stats_percpu[curcpu].drop_pullup_failed++;
+			counter_u64_add(priv->drop_pullup_failed, 1);
 #if ENABLE_DEBUG_STATS
-			if (st != NULL)
-				st->pullup_failed++;
+			if (atomic_load_acq_8(&priv->stats_mode) == STATS_MODE_PERCPU)
+				counter_u64_add(priv->pullup_failed, 1);
+#endif
 #endif
 			return (NULL);
 		}
@@ -984,18 +950,19 @@ found_mss:
 
 	/* Ensure mbuf is writable (not shared) */
 	if (M_WRITABLE(m) == 0) {
-#if ENABLE_DEBUG_STATS
-		if (st != NULL)
-			st->unshare_count++;
+#if ENABLE_STATS && ENABLE_DEBUG_STATS
+		if (atomic_load_acq_8(&priv->stats_mode) == STATS_MODE_PERCPU)
+			counter_u64_add(priv->unshare_count, 1);
 #endif
 		m = m_unshare(m, M_NOWAIT);
 		if (m == NULL) {
+#if ENABLE_STATS
 			/* Permanent counter: packet dropped (always incremented) */
-			if (priv->stats_percpu != NULL)
-				priv->stats_percpu[curcpu].drop_unshare_failed++;
+			counter_u64_add(priv->drop_unshare_failed, 1);
 #if ENABLE_DEBUG_STATS
-			if (st != NULL)
-				st->unshare_failed++;
+			if (atomic_load_acq_8(&priv->stats_mode) == STATS_MODE_PERCPU)
+				counter_u64_add(priv->unshare_failed, 1);
+#endif
 #endif
 			return (NULL);
 		}
@@ -1024,8 +991,8 @@ found_mss:
 
 #if ENABLE_STATS
 	/* Increment rewritten counter (if not disabled) */
-	if (st != NULL)
-		st->packets_rewritten++;
+	if (atomic_load_acq_8(&priv->stats_mode) == STATS_MODE_PERCPU)
+		counter_u64_add(priv->packets_rewritten, 1);
 #endif
 
 	return (m);
@@ -1049,14 +1016,32 @@ ng_mss_rewrite_constructor(node_p node)
 #if ENABLE_STATS
 	/* Default to disabled statistics for maximum performance */
 	atomic_store_rel_8(&priv->stats_mode, STATS_MODE_DISABLED);
-	/* Allocate per-CPU array immediately (never-free design) */
-	priv->stats_percpu = malloc(sizeof(struct ng_mss_stats_percpu) * mp_ncpus,
-	    M_NETGRAPH, M_WAITOK | M_ZERO);
+
+	/* Allocate counter(9) counters */
+	priv->packets_processed = counter_u64_alloc(M_WAITOK);
+	priv->packets_rewritten = counter_u64_alloc(M_WAITOK);
+	/* Permanent counters (always collected) */
+	priv->drop_pullup_failed = counter_u64_alloc(M_WAITOK);
+	priv->drop_unshare_failed = counter_u64_alloc(M_WAITOK);
+	priv->skip_fragmented_ipv4 = counter_u64_alloc(M_WAITOK);
+#if ENABLE_DEBUG_STATS
+	/* Debug counters */
+	priv->fast_dispatch_count = counter_u64_alloc(M_WAITOK);
+	priv->safe_dispatch_count = counter_u64_alloc(M_WAITOK);
+	priv->pullup_count = counter_u64_alloc(M_WAITOK);
+	priv->pullup_failed = counter_u64_alloc(M_WAITOK);
+	priv->unshare_count = counter_u64_alloc(M_WAITOK);
+	priv->unshare_failed = counter_u64_alloc(M_WAITOK);
+	priv->skip_non_tcp = counter_u64_alloc(M_WAITOK);
+	priv->skip_ipv6_non_tcp = counter_u64_alloc(M_WAITOK);
+	priv->skip_offload = counter_u64_alloc(M_WAITOK);
+	priv->skip_no_mss = counter_u64_alloc(M_WAITOK);
+	priv->skip_mss_ok = counter_u64_alloc(M_WAITOK);
+#endif
 	/* Initialize mutex for getstats/resetstats */
 	mtx_init(&priv->stats_mtx, "ng_mss_stats", NULL, MTX_DEF);
 #else
 	atomic_store_rel_8(&priv->stats_mode, STATS_MODE_DISABLED);
-	priv->stats_percpu = NULL;
 #endif
 
 	NG_NODE_SET_PRIVATE(node, priv);
@@ -1073,10 +1058,26 @@ ng_mss_rewrite_shutdown(node_p node)
 	const priv_p priv = NG_NODE_PRIVATE(node);
 
 #if ENABLE_STATS
-	if (priv->stats_percpu != NULL) {
-		mtx_destroy(&priv->stats_mtx);
-		free(priv->stats_percpu, M_NETGRAPH);
-	}
+	/* Free counter(9) counters */
+	counter_u64_free(priv->packets_processed);
+	counter_u64_free(priv->packets_rewritten);
+	counter_u64_free(priv->drop_pullup_failed);
+	counter_u64_free(priv->drop_unshare_failed);
+	counter_u64_free(priv->skip_fragmented_ipv4);
+#if ENABLE_DEBUG_STATS
+	counter_u64_free(priv->fast_dispatch_count);
+	counter_u64_free(priv->safe_dispatch_count);
+	counter_u64_free(priv->pullup_count);
+	counter_u64_free(priv->pullup_failed);
+	counter_u64_free(priv->unshare_count);
+	counter_u64_free(priv->unshare_failed);
+	counter_u64_free(priv->skip_non_tcp);
+	counter_u64_free(priv->skip_ipv6_non_tcp);
+	counter_u64_free(priv->skip_offload);
+	counter_u64_free(priv->skip_no_mss);
+	counter_u64_free(priv->skip_mss_ok);
+#endif
+	mtx_destroy(&priv->stats_mtx);
 #endif
 
 	free(priv, M_NETGRAPH);
@@ -1179,49 +1180,25 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 			/* Lock to prevent race with resetstats */
 			mtx_lock(&priv->stats_mtx);
 
-			/* Aggregate per-CPU counters */
-			stats->packets_processed = 0;
-			stats->packets_rewritten = 0;
-			stats->drop_pullup_failed = 0;
-			stats->drop_unshare_failed = 0;
-			stats->skip_fragmented_ipv4 = 0;
+			/* Fetch counters using counter(9) API (aggregates all CPUs) */
+			stats->packets_processed = counter_u64_fetch(priv->packets_processed);
+			stats->packets_rewritten = counter_u64_fetch(priv->packets_rewritten);
+			stats->drop_pullup_failed = counter_u64_fetch(priv->drop_pullup_failed);
+			stats->drop_unshare_failed = counter_u64_fetch(priv->drop_unshare_failed);
+			stats->skip_fragmented_ipv4 = counter_u64_fetch(priv->skip_fragmented_ipv4);
 #if ENABLE_DEBUG_STATS
-			stats->fast_dispatch_count = 0;
-			stats->safe_dispatch_count = 0;
-			stats->pullup_count = 0;
-			stats->pullup_failed = 0;
-			stats->unshare_count = 0;
-			stats->unshare_failed = 0;
-			stats->skip_non_tcp = 0;
-			stats->skip_ipv6_non_tcp = 0;
-			stats->skip_offload = 0;
-			stats->skip_no_mss = 0;
-			stats->skip_mss_ok = 0;
+			stats->fast_dispatch_count = counter_u64_fetch(priv->fast_dispatch_count);
+			stats->safe_dispatch_count = counter_u64_fetch(priv->safe_dispatch_count);
+			stats->pullup_count = counter_u64_fetch(priv->pullup_count);
+			stats->pullup_failed = counter_u64_fetch(priv->pullup_failed);
+			stats->unshare_count = counter_u64_fetch(priv->unshare_count);
+			stats->unshare_failed = counter_u64_fetch(priv->unshare_failed);
+			stats->skip_non_tcp = counter_u64_fetch(priv->skip_non_tcp);
+			stats->skip_ipv6_non_tcp = counter_u64_fetch(priv->skip_ipv6_non_tcp);
+			stats->skip_offload = counter_u64_fetch(priv->skip_offload);
+			stats->skip_no_mss = counter_u64_fetch(priv->skip_no_mss);
+			stats->skip_mss_ok = counter_u64_fetch(priv->skip_mss_ok);
 #endif
-
-			if (priv->stats_percpu != NULL) {
-				int cpu;
-				for (cpu = 0; cpu < mp_ncpus; cpu++) {
-					stats->packets_processed += priv->stats_percpu[cpu].packets_processed;
-					stats->packets_rewritten += priv->stats_percpu[cpu].packets_rewritten;
-					stats->drop_pullup_failed += priv->stats_percpu[cpu].drop_pullup_failed;
-					stats->drop_unshare_failed += priv->stats_percpu[cpu].drop_unshare_failed;
-					stats->skip_fragmented_ipv4 += priv->stats_percpu[cpu].skip_fragmented_ipv4;
-#if ENABLE_DEBUG_STATS
-					stats->fast_dispatch_count += priv->stats_percpu[cpu].fast_dispatch_count;
-					stats->safe_dispatch_count += priv->stats_percpu[cpu].safe_dispatch_count;
-					stats->pullup_count += priv->stats_percpu[cpu].pullup_count;
-					stats->pullup_failed += priv->stats_percpu[cpu].pullup_failed;
-					stats->unshare_count += priv->stats_percpu[cpu].unshare_count;
-					stats->unshare_failed += priv->stats_percpu[cpu].unshare_failed;
-					stats->skip_non_tcp += priv->stats_percpu[cpu].skip_non_tcp;
-					stats->skip_ipv6_non_tcp += priv->stats_percpu[cpu].skip_ipv6_non_tcp;
-					stats->skip_offload += priv->stats_percpu[cpu].skip_offload;
-					stats->skip_no_mss += priv->stats_percpu[cpu].skip_no_mss;
-					stats->skip_mss_ok += priv->stats_percpu[cpu].skip_mss_ok;
-#endif
-				}
-			}
 
 			/* Subtract baseline (for resetstats support) */
 			stats->packets_processed -= priv->baseline_processed;
@@ -1247,6 +1224,9 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 #else
 			stats->packets_processed = 0;
 			stats->packets_rewritten = 0;
+			stats->drop_pullup_failed = 0;
+			stats->drop_unshare_failed = 0;
+			stats->skip_fragmented_ipv4 = 0;
 #endif
 			break;
 		}
@@ -1254,63 +1234,27 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 		case NGM_MSS_REWRITE_RESET_STATS:
 #if ENABLE_STATS
 		{
-			/* Baseline method: snapshot current total, don't zero live counters */
-			uint64_t total_processed = 0, total_rewritten = 0;
-			uint64_t total_drop_pullup_failed = 0, total_drop_unshare_failed = 0;
-			uint64_t total_skip_fragmented_ipv4 = 0;
-#if ENABLE_DEBUG_STATS
-			uint64_t total_fast_path = 0, total_safe_path = 0;
-			uint64_t total_pullup = 0, total_pullup_failed = 0;
-			uint64_t total_unshare = 0, total_unshare_failed = 0;
-			uint64_t total_skip_non_tcp = 0, total_skip_ipv6_non_tcp = 0;
-			uint64_t total_skip_offload = 0;
-			uint64_t total_skip_no_mss = 0, total_skip_mss_ok = 0;
-#endif
-
+			/* Baseline method: snapshot current total using counter(9) */
 			/* Lock to prevent race with getstats */
 			mtx_lock(&priv->stats_mtx);
 
-			if (priv->stats_percpu != NULL) {
-				int cpu;
-				for (cpu = 0; cpu < mp_ncpus; cpu++) {
-					total_processed += priv->stats_percpu[cpu].packets_processed;
-					total_rewritten += priv->stats_percpu[cpu].packets_rewritten;
-					total_drop_pullup_failed += priv->stats_percpu[cpu].drop_pullup_failed;
-					total_drop_unshare_failed += priv->stats_percpu[cpu].drop_unshare_failed;
-					total_skip_fragmented_ipv4 += priv->stats_percpu[cpu].skip_fragmented_ipv4;
+			priv->baseline_processed = counter_u64_fetch(priv->packets_processed);
+			priv->baseline_rewritten = counter_u64_fetch(priv->packets_rewritten);
+			priv->baseline_drop_pullup_failed = counter_u64_fetch(priv->drop_pullup_failed);
+			priv->baseline_drop_unshare_failed = counter_u64_fetch(priv->drop_unshare_failed);
+			priv->baseline_skip_fragmented_ipv4 = counter_u64_fetch(priv->skip_fragmented_ipv4);
 #if ENABLE_DEBUG_STATS
-					total_fast_path += priv->stats_percpu[cpu].fast_dispatch_count;
-					total_safe_path += priv->stats_percpu[cpu].safe_dispatch_count;
-					total_pullup += priv->stats_percpu[cpu].pullup_count;
-					total_pullup_failed += priv->stats_percpu[cpu].pullup_failed;
-					total_unshare += priv->stats_percpu[cpu].unshare_count;
-					total_unshare_failed += priv->stats_percpu[cpu].unshare_failed;
-					total_skip_non_tcp += priv->stats_percpu[cpu].skip_non_tcp;
-					total_skip_ipv6_non_tcp += priv->stats_percpu[cpu].skip_ipv6_non_tcp;
-					total_skip_offload += priv->stats_percpu[cpu].skip_offload;
-					total_skip_no_mss += priv->stats_percpu[cpu].skip_no_mss;
-					total_skip_mss_ok += priv->stats_percpu[cpu].skip_mss_ok;
-#endif
-				}
-			}
-
-			priv->baseline_processed = total_processed;
-			priv->baseline_rewritten = total_rewritten;
-			priv->baseline_drop_pullup_failed = total_drop_pullup_failed;
-			priv->baseline_drop_unshare_failed = total_drop_unshare_failed;
-			priv->baseline_skip_fragmented_ipv4 = total_skip_fragmented_ipv4;
-#if ENABLE_DEBUG_STATS
-			priv->baseline_fast_dispatch_count = total_fast_path;
-			priv->baseline_safe_dispatch_count = total_safe_path;
-			priv->baseline_pullup_count = total_pullup;
-			priv->baseline_pullup_failed = total_pullup_failed;
-			priv->baseline_unshare_count = total_unshare;
-			priv->baseline_unshare_failed = total_unshare_failed;
-			priv->baseline_skip_non_tcp = total_skip_non_tcp;
-			priv->baseline_skip_ipv6_non_tcp = total_skip_ipv6_non_tcp;
-			priv->baseline_skip_offload = total_skip_offload;
-			priv->baseline_skip_no_mss = total_skip_no_mss;
-			priv->baseline_skip_mss_ok = total_skip_mss_ok;
+			priv->baseline_fast_dispatch_count = counter_u64_fetch(priv->fast_dispatch_count);
+			priv->baseline_safe_dispatch_count = counter_u64_fetch(priv->safe_dispatch_count);
+			priv->baseline_pullup_count = counter_u64_fetch(priv->pullup_count);
+			priv->baseline_pullup_failed = counter_u64_fetch(priv->pullup_failed);
+			priv->baseline_unshare_count = counter_u64_fetch(priv->unshare_count);
+			priv->baseline_unshare_failed = counter_u64_fetch(priv->unshare_failed);
+			priv->baseline_skip_non_tcp = counter_u64_fetch(priv->skip_non_tcp);
+			priv->baseline_skip_ipv6_non_tcp = counter_u64_fetch(priv->skip_ipv6_non_tcp);
+			priv->baseline_skip_offload = counter_u64_fetch(priv->skip_offload);
+			priv->baseline_skip_no_mss = counter_u64_fetch(priv->skip_no_mss);
+			priv->baseline_skip_mss_ok = counter_u64_fetch(priv->skip_mss_ok);
 #endif
 
 			mtx_unlock(&priv->stats_mtx);
@@ -1336,7 +1280,7 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 				break;
 			}
 
-			/* Update mode (stats_percpu already allocated at init, never freed) */
+			/* Update mode (counter(9) counters already allocated at init) */
 			atomic_store_rel_8(&priv->stats_mode, mode_conf->mode);
 #else
 			error = EOPNOTSUPP;
