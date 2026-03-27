@@ -357,6 +357,12 @@ echo "=========================================="
 
 run_inject_test "inject_shared" "{ mss=1460 ipv6=0 split_offset=0 csum_flags=0 ext_type=0 }" 1 1 "Shared mbuf (M_WRITABLE==0), IPv4, MSS rewrite" "unshare_count" 1
 
+# Test: Shared mbuf but NO rewrite needed → should NOT call m_unshare()
+# This validates lazy unshare optimization (performance critical)
+# The run_inject_test already verifies skip_mss_ok=1, confirming no rewrite
+# We additionally verify unshare_count=0 for this test (no m_unshare called)
+run_inject_test "inject_shared" "{ mss=1200 ipv6=0 split_offset=0 csum_flags=0 ext_type=0 }" 1 0 "Shared mbuf, MSS=1200: no unshare needed" "unshare_count" 0
+
 echo ""
 echo "=========================================="
 echo "  Test 4: Upper Hook + Checksum Offload"
@@ -403,6 +409,106 @@ run_inject_test "inject_fragmented" "{ mss=1200 ipv6=0 split_offset=14 csum_flag
 # Test: Fragmented + Shared (most complex case)
 # Note: This is complex to create and test, so we skip it for now
 skip_test "Fragmented + Shared mbuf (complex case, not implemented in injector)"
+
+echo ""
+echo "=========================================="
+echo "  Test 7: Fast Path Entry Boundary (m_len 57/58/59)"
+echo "=========================================="
+echo "Testing NG_MSS_FAST_PATH_MIN_LEN threshold (58 bytes)"
+echo ""
+
+# Critical boundary tests for the optimized fast path entry condition
+# NG_MSS_FAST_PATH_MIN_LEN = 58, so:
+# - m_len < 58 → safe_dispatch_count should increase
+# - m_len >= 58 → fast_dispatch_count should increase
+
+# Test: m_len = 57 (just below threshold) → safe path entry
+if [ "$DEBUG_STATS_ENABLED" = "1" ]; then
+	run_inject_test "inject_fragmented" "{ mss=1460 ipv6=0 split_offset=57 csum_flags=0 ext_type=0 }" 1 1 "m_len=57 (< 58): safe path entry" "safe_dispatch_count" 1
+else
+	run_inject_test "inject_fragmented" "{ mss=1460 ipv6=0 split_offset=57 csum_flags=0 ext_type=0 }" 1 1 "m_len=57 (< 58): safe path entry"
+fi
+
+# Test: m_len = 58 (exactly at threshold) → fast path entry
+if [ "$DEBUG_STATS_ENABLED" = "1" ]; then
+	run_inject_test "inject_fragmented" "{ mss=1460 ipv6=0 split_offset=58 csum_flags=0 ext_type=0 }" 1 1 "m_len=58 (== 58): fast path entry" "fast_dispatch_count" 1
+else
+	run_inject_test "inject_fragmented" "{ mss=1460 ipv6=0 split_offset=58 csum_flags=0 ext_type=0 }" 1 1 "m_len=58 (== 58): fast path entry"
+fi
+
+# Test: m_len = 59 (just above threshold) → fast path entry
+if [ "$DEBUG_STATS_ENABLED" = "1" ]; then
+	run_inject_test "inject_fragmented" "{ mss=1460 ipv6=0 split_offset=59 csum_flags=0 ext_type=0 }" 1 1 "m_len=59 (> 58): fast path entry" "fast_dispatch_count" 1
+else
+	run_inject_test "inject_fragmented" "{ mss=1460 ipv6=0 split_offset=59 csum_flags=0 ext_type=0 }" 1 1 "m_len=59 (> 58): fast path entry"
+fi
+
+echo ""
+echo "=========================================="
+echo "  Test 8: Fast Entry → Safe Fallback (Design Validation)"
+echo "=========================================="
+echo "Testing m_len=58 fast entry with safe fallback on dynamic checks"
+echo ""
+
+# Test: m_len=58, TCP options extend beyond → fast entry, safe fallback
+# IPv4 packet structure (66 bytes total):
+#   Ethernet(14) + IPv4(20) + TCP(20) + TCP options(12) = 66
+# Split at 58:
+#   first mbuf: 58 bytes (Eth + IPv4 + TCP base + 4 bytes options)
+#   second mbuf: 8 bytes (remaining options)
+# Expected: fast_dispatch=1, packets_processed=1 (no double counting)
+if [ "$DEBUG_STATS_ENABLED" = "1" ]; then
+	run_inject_test "inject_fragmented" "{ mss=1460 ipv6=0 split_offset=58 csum_flags=0 ext_type=0 }" 1 1 "m_len=58, TCP options split: fast→safe fallback" "fast_dispatch_count" 1
+else
+	run_inject_test "inject_fragmented" "{ mss=1460 ipv6=0 split_offset=58 csum_flags=0 ext_type=0 }" 1 1 "m_len=58, TCP options split: fast→safe fallback"
+fi
+
+# Note: This test validates the core design change - entry at 58 is safe
+# even when TCP options require safe path processing
+
+echo ""
+echo "=========================================="
+echo "  Test 9: MSS Option Across mbuf Boundary"
+echo "=========================================="
+echo "Testing m_copydata() robustness with MSS option split across mbufs"
+echo ""
+
+# MSS option structure in packet (4 bytes): kind(1) + len(1) + value(2)
+# IPv4 packet: Ethernet(14) + IPv4(20) + TCP(20) + options(12)
+# TCP options: NOP(1) + NOP(1) + MSS(4) + padding
+# MSS option starts at byte 56 (14 + 20 + 20 + 2)
+
+# Test: Split at MSS option kind byte (byte 56)
+if [ "$DEBUG_STATS_ENABLED" = "1" ]; then
+	run_inject_test "inject_fragmented" "{ mss=1460 ipv6=0 split_offset=56 csum_flags=0 ext_type=0 }" 1 1 "MSS split: kind at boundary (offset 56)" "safe_dispatch_count" 1
+else
+	run_inject_test "inject_fragmented" "{ mss=1460 ipv6=0 split_offset=56 csum_flags=0 ext_type=0 }" 1 1 "MSS split: kind at boundary (offset 56)"
+fi
+
+# Test: Split at MSS option length byte (byte 57)
+if [ "$DEBUG_STATS_ENABLED" = "1" ]; then
+	run_inject_test "inject_fragmented" "{ mss=1460 ipv6=0 split_offset=57 csum_flags=0 ext_type=0 }" 1 1 "MSS split: length at boundary (offset 57)" "safe_dispatch_count" 1
+else
+	run_inject_test "inject_fragmented" "{ mss=1460 ipv6=0 split_offset=57 csum_flags=0 ext_type=0 }" 1 1 "MSS split: length at boundary (offset 57)"
+fi
+
+# Test: Split at MSS value high byte (byte 58)
+if [ "$DEBUG_STATS_ENABLED" = "1" ]; then
+	run_inject_test "inject_fragmented" "{ mss=1460 ipv6=0 split_offset=58 csum_flags=0 ext_type=0 }" 1 1 "MSS split: value[0] at boundary (offset 58)" "fast_dispatch_count" 1
+else
+	run_inject_test "inject_fragmented" "{ mss=1460 ipv6=0 split_offset=58 csum_flags=0 ext_type=0 }" 1 1 "MSS split: value[0] at boundary (offset 58)"
+fi
+
+# Test: Split at MSS value low byte (byte 59)
+if [ "$DEBUG_STATS_ENABLED" = "1" ]; then
+	run_inject_test "inject_fragmented" "{ mss=1460 ipv6=0 split_offset=59 csum_flags=0 ext_type=0 }" 1 1 "MSS split: value[1] at boundary (offset 59)" "fast_dispatch_count" 1
+else
+	run_inject_test "inject_fragmented" "{ mss=1460 ipv6=0 split_offset=59 csum_flags=0 ext_type=0 }" 1 1 "MSS split: value[1] at boundary (offset 59)"
+fi
+
+echo ""
+echo "Note: These tests validate that m_copydata() correctly handles"
+echo "MSS option parsing even when the option spans multiple mbufs."
 
 echo ""
 echo "=========================================="

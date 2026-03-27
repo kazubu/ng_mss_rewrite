@@ -32,18 +32,18 @@ CRASHES=0
 # Test result tracking
 pass_test() {
     TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo "${GREEN}✓${NC} $1"
+    printf "${GREEN}✓${NC} %s\n" "$1"
 }
 
 fail_test() {
     TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo "${RED}✗${NC} $1"
-    echo "  Expected: $2, Got: $3"
+    printf "${RED}✗${NC} %s\n" "$1"
+    printf "  Expected: %s, Got: %s\n" "$2" "$3"
 }
 
 crash_detected() {
     CRASHES=$((CRASHES + 1))
-    echo "${RED}💥 CRASH${NC}: $1"
+    printf "${RED}💥 CRASH${NC}: %s\n" "$1"
 }
 
 # Cleanup function
@@ -234,7 +234,7 @@ if ! setup; then
 fi
 
 echo ""
-echo "${BLUE}=== Phase 1: Random MSS values ===${NC}"
+printf "${BLUE}=== Phase 1: Random MSS values ===${NC}\n"
 echo ""
 
 # Test 100 random MSS values
@@ -250,7 +250,7 @@ for i in $(seq 1 100); do
 done
 
 echo ""
-echo "${BLUE}=== Phase 2: Random TCP option lengths ===${NC}"
+printf "${BLUE}=== Phase 2: Random TCP option lengths ===${NC}\n"
 echo ""
 
 # Test various option lengths
@@ -274,7 +274,7 @@ $IP_LEN 00 01 00 00 40 06 00 00 0a 00 00 01 0a 00
 done
 
 echo ""
-echo "${BLUE}=== Phase 3: Random TCP data offsets ===${NC}"
+printf "${BLUE}=== Phase 3: Random TCP data offsets ===${NC}\n"
 echo ""
 
 # Test various data offset values (0-15)
@@ -287,7 +287,7 @@ for data_off in 0 1 2 3 4 5 6 7 8 9 a b c d e f; do
 done
 
 echo ""
-echo "${BLUE}=== Phase 4: Random IP lengths ===${NC}"
+printf "${BLUE}=== Phase 4: Random IP lengths ===${NC}\n"
 echo ""
 
 # Test various IP total lengths
@@ -300,7 +300,7 @@ for ip_len in 20 28 2c 34 40 60 80 ff 00 01 02 ff ff; do
 done
 
 echo ""
-echo "${BLUE}=== Phase 5: Random TCP flags ===${NC}"
+printf "${BLUE}=== Phase 5: Random TCP flags ===${NC}\n"
 echo ""
 
 # Test various TCP flag combinations
@@ -313,7 +313,7 @@ for flags in 00 01 02 04 08 10 20 40 80 ff 3f 1f; do
 done
 
 echo ""
-echo "${BLUE}=== Phase 6: Malformed MSS options ===${NC}"
+printf "${BLUE}=== Phase 6: Malformed MSS options ===${NC}\n"
 echo ""
 
 # Test malformed MSS options
@@ -340,7 +340,7 @@ for i in "${!MSS_TESTS[@]}"; do
 done
 
 echo ""
-echo "${BLUE}=== Phase 7: Random IPv6 packets ===${NC}"
+printf "${BLUE}=== Phase 7: Random IPv6 packets ===${NC}\n"
 echo ""
 
 # Test random IPv6 packets
@@ -357,7 +357,7 @@ $(rand_word) $(rand_word) $(rand_word) $(rand_word) 00 50 00 50 00 00
 done
 
 echo ""
-echo "${BLUE}=== Phase 8: Random VLAN tags ===${NC}"
+printf "${BLUE}=== Phase 8: Random VLAN tags ===${NC}\n"
 echo ""
 
 # Test various VLAN configurations
@@ -374,7 +374,7 @@ for i in $(seq 1 30); do
 done
 
 echo ""
-echo "${BLUE}=== Phase 9: Edge case packet sizes ===${NC}"
+printf "${BLUE}=== Phase 9: Edge case packet sizes ===${NC}\n"
 echo ""
 
 # Test minimum size packets
@@ -401,7 +401,7 @@ send_fuzz_packet "ff ff ff ff ff ff 00 00 00 00 00 00 08 00 45 00
     "Maximum TCP options (60 bytes)"
 
 echo ""
-echo "${BLUE}=== Phase 10: Completely random packets ===${NC}"
+printf "${BLUE}=== Phase 10: Completely random packets ===${NC}\n"
 echo ""
 
 # Generate completely random packets
@@ -421,9 +421,9 @@ echo "========================================"
 echo "Fuzzing Summary"
 echo "========================================"
 echo "Total tests run: $TESTS_RUN"
-echo "${GREEN}Passed: $TESTS_PASSED${NC}"
-echo "${RED}Failed: $TESTS_FAILED${NC}"
-echo "${RED}Crashes: $CRASHES${NC}"
+printf "${GREEN}Passed: %d${NC}\n" "$TESTS_PASSED"
+printf "${RED}Failed: %d${NC}\n" "$TESTS_FAILED"
+printf "${RED}Crashes: %d${NC}\n" "$CRASHES"
 echo ""
 
 # Cleanup
@@ -433,14 +433,14 @@ cleanup
 # Final verification
 REMAINING=$(ngctl list 2>/dev/null | grep -c "fuzz_" || true)
 if [ $REMAINING -gt 0 ]; then
-    echo "${YELLOW}Warning: $REMAINING fuzz nodes still exist after cleanup${NC}"
+    printf "${YELLOW}Warning: %d fuzz nodes still exist after cleanup${NC}\n" "$REMAINING"
     ngctl list 2>/dev/null | grep "fuzz_"
 fi
 
 if [ $CRASHES -eq 0 ]; then
-    echo "${GREEN}No crashes detected!${NC}"
+    printf "${GREEN}No crashes detected!${NC}\n"
     exit 0
 else
-    echo "${RED}Crashes detected!${NC}"
+    printf "${RED}Crashes detected!${NC}\n"
     exit 1
 fi

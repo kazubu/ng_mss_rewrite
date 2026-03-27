@@ -335,7 +335,7 @@ tcp_checksum_adjust(uint16_t old_check, uint16_t old_data, uint16_t new_data)
  * Forward declarations for fast and safe paths
  */
 static struct mbuf *ng_mss_rewrite_process_fast(priv_p priv, struct mbuf *m, int from_upper);
-static struct mbuf *ng_mss_rewrite_process_safe(priv_p priv, struct mbuf *m, int from_upper);
+static struct mbuf *ng_mss_rewrite_process_safe(priv_p priv, struct mbuf *m, int from_upper, int from_fast_fallback);
 
 /*
  * Process and possibly rewrite MSS in a packet
@@ -377,7 +377,7 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m, int from_upper)
 				priv->stats_percpu[curcpu].safe_dispatch_count++;
 		}
 #endif
-		return ng_mss_rewrite_process_safe(priv, m, from_upper);
+		return ng_mss_rewrite_process_safe(priv, m, from_upper, 0);
 	}
 }
 
@@ -442,7 +442,7 @@ ng_mss_rewrite_process_fast(priv_p priv, struct mbuf *m, int from_upper)
 			return (m);
 		/* Check IP options dynamically if ip_hlen > sizeof(struct ip) */
 		if (ip_hlen > (int)sizeof(struct ip) && m->m_len < offset + ip_hlen)
-			return ng_mss_rewrite_process_safe(priv, m, from_upper);
+			return ng_mss_rewrite_process_safe(priv, m, from_upper, 1);
 
 		if (ip4->ip_p != IPPROTO_TCP)
 			return (m);
@@ -494,7 +494,7 @@ ng_mss_rewrite_process_fast(priv_p priv, struct mbuf *m, int from_upper)
 	 * This exceeds NG_MSS_FAST_PATH_MIN_LEN (58), so explicit check needed.
 	 */
 	if (m->m_len < offset + sizeof(struct tcphdr))
-		return ng_mss_rewrite_process_safe(priv, m, from_upper);
+		return ng_mss_rewrite_process_safe(priv, m, from_upper, 1);
 
 	tcp = (struct tcphdr *)(pkt + offset);
 	tcp_hlen = (tcp->th_off & 0xf) << 2;
@@ -523,7 +523,7 @@ ng_mss_rewrite_process_fast(priv_p priv, struct mbuf *m, int from_upper)
 
 	/* Fall back to safe path if TCP options extend beyond m_len */
 	if (m->m_len < offset + tcp_hlen)
-		return ng_mss_rewrite_process_safe(priv, m, from_upper);
+		return ng_mss_rewrite_process_safe(priv, m, from_upper, 1);
 
 	/* Search for MSS option */
 	options = (uint8_t *)(tcp + 1);
@@ -629,7 +629,7 @@ ng_mss_rewrite_process_fast(priv_p priv, struct mbuf *m, int from_upper)
  * Safe path: Process packet using m_copydata() for fragmented mbufs
  */
 static struct mbuf *
-ng_mss_rewrite_process_safe(priv_p priv, struct mbuf *m, int from_upper)
+ng_mss_rewrite_process_safe(priv_p priv, struct mbuf *m, int from_upper, int from_fast_fallback)
 {
 	/* Local copies for safe parsing via m_copydata() */
 	struct ether_header eh;
@@ -776,8 +776,11 @@ ng_mss_rewrite_process_safe(priv_p priv, struct mbuf *m, int from_upper)
 	if (stats_mode == STATS_MODE_PERCPU)
 		st = &priv->stats_percpu[curcpu];
 
-	/* Increment SYN packets counter (if not disabled) */
-	if (st != NULL)
+	/*
+	 * Increment SYN packets counter (if not disabled)
+	 * Skip if called as fallback from fast path (already counted)
+	 */
+	if (st != NULL && !from_fast_fallback)
 		st->packets_processed++;
 #endif
 

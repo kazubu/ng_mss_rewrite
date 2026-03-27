@@ -27,14 +27,14 @@ TESTS_FAILED=0
 # Test result tracking
 pass_test() {
     TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo "${GREEN}✓ PASS${NC}: $1"
+    printf "${GREEN}✓ PASS${NC}: %s\n" "$1"
 }
 
 fail_test() {
     TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo "${RED}✗ FAIL${NC}: $1"
-    echo "  Expected: $2"
-    echo "  Got: $3"
+    printf "${RED}✗ FAIL${NC}: %s\n" "$1"
+    printf "  Expected: %s\n" "$2"
+    printf "  Got: %s\n" "$3"
 }
 
 skip_test() {
@@ -446,8 +446,8 @@ echo "========================================"
 echo "Test Summary"
 echo "========================================"
 echo "Total tests run: $TESTS_RUN"
-echo "${GREEN}Passed: $TESTS_PASSED${NC}"
-echo "${RED}Failed: $TESTS_FAILED${NC}"
+printf "${GREEN}Passed: %d${NC}\n" "$TESTS_PASSED"
+printf "${RED}Failed: %d${NC}\n" "$TESTS_FAILED"
 echo ""
 
 # Cleanup
@@ -457,13 +457,13 @@ cleanup
 # Final verification
 REMAINING=$(ngctl list 2>/dev/null | grep -c "test_" || true)
 if [ $REMAINING -gt 0 ]; then
-    echo "${YELLOW}Warning: $REMAINING test nodes still exist after cleanup${NC}"
+    printf "${YELLOW}Warning: %d test nodes still exist after cleanup${NC}\n" "$REMAINING"
 fi
 
 if [ $TESTS_FAILED -eq 0 ]; then
-    echo "${GREEN}All tests passed!${NC}"
+    printf "${GREEN}All tests passed!${NC}\n"
     exit 0
 else
-    echo "${RED}Some tests failed!${NC}"
+    printf "${RED}Some tests failed!${NC}\n"
     exit 1
 fi
