@@ -31,6 +31,7 @@
 struct ng_mbuf_inject_private {
 	hook_p	output;		/* Output hook */
 	u_long	packets_sent;	/* Statistics */
+	struct mbuf *held_mbuf;	/* Held mbuf for shared test (keeps refcount > 1) */
 };
 typedef struct ng_mbuf_inject_private *priv_p;
 
@@ -160,11 +161,12 @@ build_tcp_syn_packet(int ipv6, uint16_t mss)
 	int pkt_len;
 
 	if (ipv6) {
-		/* Ethernet + IPv6 + TCP + Options (MSS + NOP + NOP) */
+		/* Ethernet + IPv6 + TCP + Options (MSS + padding) */
 		pkt_len = 14 + 40 + 20 + 8;
 	} else {
-		/* Ethernet + IPv4 + TCP + Options (MSS + NOP + NOP) */
-		pkt_len = 14 + 20 + 20 + 8;
+		/* Ethernet + IPv4 + TCP + Options (MSS + padding) */
+		/* Need >= 66 bytes for fast path: 14 + 20 + 20 + 12 = 66 */
+		pkt_len = 14 + 20 + 20 + 12;
 	}
 
 	m = m_getcl(M_NOWAIT, MT_DATA, M_PKTHDR);
@@ -199,7 +201,7 @@ build_tcp_syn_packet(int ipv6, uint16_t mss)
 		struct ip *ip = (struct ip *)p;
 		ip->ip_v = 4;
 		ip->ip_hl = 5;
-		ip->ip_len = htons(20 + 20 + 8);
+		ip->ip_len = htons(20 + 20 + 12);	/* IP + TCP + Options */
 		ip->ip_ttl = 64;
 		ip->ip_p = IPPROTO_TCP;
 		ip->ip_src.s_addr = htonl(0x0a000001);	/* 10.0.0.1 */
@@ -213,12 +215,16 @@ build_tcp_syn_packet(int ipv6, uint16_t mss)
 	tcp->th_sport = htons(12345);
 	tcp->th_dport = htons(80);
 	tcp->th_seq = htonl(1000);
-	tcp->th_off = 7;	/* 20 bytes header + 8 bytes options = 28 bytes / 4 */
+	if (ipv6) {
+		tcp->th_off = 7;	/* 20 bytes header + 8 bytes options = 28 bytes / 4 */
+	} else {
+		tcp->th_off = 8;	/* 20 bytes header + 12 bytes options = 32 bytes / 4 */
+	}
 	tcp->th_flags = TH_SYN;
 	tcp->th_win = htons(65535);
 	p += 20;
 
-	/* TCP options: NOP + NOP + MSS */
+	/* TCP options: NOP + NOP + MSS + padding */
 	p[0] = 1;	/* TCPOPT_NOP */
 	p[1] = 1;	/* TCPOPT_NOP */
 	p[2] = 2;	/* TCPOPT_MAXSEG */
@@ -227,6 +233,13 @@ build_tcp_syn_packet(int ipv6, uint16_t mss)
 	p[5] = mss & 0xff;
 	p[6] = 1;	/* TCPOPT_NOP */
 	p[7] = 1;	/* TCPOPT_NOP */
+	if (!ipv6) {
+		/* Additional padding for IPv4 to reach 66 bytes total */
+		p[8] = 1;	/* TCPOPT_NOP */
+		p[9] = 1;	/* TCPOPT_NOP */
+		p[10] = 1;	/* TCPOPT_NOP */
+		p[11] = 1;	/* TCPOPT_NOP */
+	}
 
 	return (m);
 }
@@ -346,33 +359,39 @@ inject_shared(priv_p priv, struct ng_mbuf_inject_params *params)
 {
 	struct mbuf *m, *m_shared;
 
+	/* Free any previously held mbuf */
+	if (priv->held_mbuf != NULL) {
+		m_freem(priv->held_mbuf);
+		priv->held_mbuf = NULL;
+	}
+
 	m = build_tcp_syn_packet(params->ipv6, params->mss);
 	if (m == NULL)
 		return (ENOMEM);
 
-	/* Create a shared copy using m_dup() or manually set M_EXT_WRITABLE to fail */
-	/* m_dup() creates a new mbuf but shares the external storage */
-	m_shared = m_dup(m, M_NOWAIT);
+	/* Create a shared copy using m_copym() to share the external cluster */
+	/* m_copym() with M_COPYALL creates a new mbuf chain that shares data */
+	m_shared = m_copym(m, 0, M_COPYALL, M_NOWAIT);
 	if (m_shared == NULL) {
 		m_freem(m);
 		return (ENOMEM);
 	}
 
-	/* Keep original to maintain refcount */
+	/* Keep original to maintain refcount > 1 on the external cluster */
 	/* This makes M_WRITABLE(m_shared) return 0 */
+	priv->held_mbuf = m;	/* Hold original, don't free it yet */
 
 	/* Send shared copy to output hook */
 	if (priv->output != NULL) {
 		int error;
 		NG_SEND_DATA_ONLY(error, priv->output, m_shared);
-		/* Free original after sending */
-		m_freem(m);
 		if (error == 0)
 			priv->packets_sent++;
 		return (error);
 	} else {
 		m_freem(m_shared);
-		m_freem(m);
+		m_freem(priv->held_mbuf);
+		priv->held_mbuf = NULL;
 		return (ENOTCONN);
 	}
 }
@@ -668,6 +687,10 @@ static int
 ng_mbuf_inject_shutdown(node_p node)
 {
 	priv_p priv = NG_NODE_PRIVATE(node);
+
+	/* Free any held mbuf */
+	if (priv->held_mbuf != NULL)
+		m_freem(priv->held_mbuf);
 
 	NG_NODE_UNREF(node);
 	free(priv, M_NETGRAPH);
