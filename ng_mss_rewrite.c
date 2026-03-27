@@ -44,6 +44,16 @@
 #define DEFAULT_MSS_IPV4	1400
 #define DEFAULT_MSS_IPV6	1380
 
+/*
+ * Fast path minimum m_len threshold
+ * Must accommodate VLAN-tagged packets with base headers.
+ * Largest base header combination is IPv6 with VLAN:
+ *   Ethernet + VLAN + IPv6 = 14 + 4 + 40 = 58 bytes
+ * (TCP header requires additional check as it starts at offset 58)
+ */
+#define NG_MSS_FAST_PATH_MIN_LEN \
+	(sizeof(struct ether_header) + ETHER_VLAN_ENCAP_LEN + sizeof(struct ip6_hdr))
+
 /* Maximum header size to pull up at once (optimization) */
 /* MAX_HDR_LEN removed - not needed with m_copydata() approach */
 
@@ -343,11 +353,12 @@ static struct mbuf *
 ng_mss_rewrite_process(priv_p priv, struct mbuf *m, int from_upper)
 {
 	/*
-	 * Typical packet length check for fast path:
-	 * Ether(14) + IP(20) + TCP(20) + Options(12) = 66 bytes
-	 * Most non-fragmented SYN packets will have at least this much contiguous.
+	 * Fast path entry condition:
+	 * Check if packet has enough contiguous data for base headers.
+	 * See NG_MSS_FAST_PATH_MIN_LEN definition for calculation.
+	 * IP/TCP options are checked dynamically inside fast path.
 	 */
-	if (m->m_len >= 66) {
+	if (m->m_len >= NG_MSS_FAST_PATH_MIN_LEN) {
 		/* Fast path: contiguous mbuf, use direct pointer access */
 #if ENABLE_DEBUG_STATS
 		{
@@ -372,7 +383,9 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m, int from_upper)
 
 /*
  * Fast path: Process packet with direct pointer access
- * Assumes m->m_len >= 66 (typical header length)
+ * Assumes m->m_len >= NG_MSS_FAST_PATH_MIN_LEN
+ * (sufficient for Ethernet + VLAN + IPv6 base header)
+ * Checks TCP base header and IP/TCP options dynamically.
  */
 static struct mbuf *
 ng_mss_rewrite_process_fast(priv_p priv, struct mbuf *m, int from_upper)
@@ -401,13 +414,14 @@ ng_mss_rewrite_process_fast(priv_p priv, struct mbuf *m, int from_upper)
 
 	/* Handle VLAN tag */
 	if (ether_type == ETHERTYPE_VLAN) {
-		if (m->m_pkthdr.len < offset + 4)
+		if (m->m_pkthdr.len < offset + ETHER_VLAN_ENCAP_LEN)
 			return (m);
-		/* Fall back to safe path if VLAN extends beyond m_len */
-		if (m->m_len < offset + 4)
-			return ng_mss_rewrite_process_safe(priv, m, from_upper);
+		/*
+		 * VLAN tag guaranteed accessible by NG_MSS_FAST_PATH_MIN_LEN.
+		 * No m_len check needed (offset + ETHER_VLAN_ENCAP_LEN = 14 + 4 = 18).
+		 */
 		ether_type = ntohs(*(uint16_t *)(pkt + offset + 2));
-		offset += 4;
+		offset += ETHER_VLAN_ENCAP_LEN;
 	}
 
 	/* Parse IP header */
@@ -415,15 +429,19 @@ ng_mss_rewrite_process_fast(priv_p priv, struct mbuf *m, int from_upper)
 		/* IPv4 */
 		if (m->m_pkthdr.len < offset + sizeof(struct ip))
 			return (m);
-		if (m->m_len < offset + sizeof(struct ip))
-			return ng_mss_rewrite_process_safe(priv, m, from_upper);
+		/*
+		 * IPv4 base header guaranteed accessible by NG_MSS_FAST_PATH_MIN_LEN.
+		 * Max offset with VLAN: sizeof(ether_header) + ETHER_VLAN_ENCAP_LEN = 18
+		 * Required: 18 + sizeof(struct ip) = 18 + 20 = 38 bytes < 58
+		 */
 
 		ip4 = (struct ip *)(pkt + offset);
 		ip_hlen = (ip4->ip_hl & 0x0f) << 2;
 
 		if (ip_hlen < (int)sizeof(struct ip) || m->m_pkthdr.len < offset + ip_hlen)
 			return (m);
-		if (m->m_len < offset + ip_hlen)
+		/* Check IP options dynamically if ip_hlen > sizeof(struct ip) */
+		if (ip_hlen > (int)sizeof(struct ip) && m->m_len < offset + ip_hlen)
 			return ng_mss_rewrite_process_safe(priv, m, from_upper);
 
 		if (ip4->ip_p != IPPROTO_TCP)
@@ -442,8 +460,11 @@ ng_mss_rewrite_process_fast(priv_p priv, struct mbuf *m, int from_upper)
 		/* IPv6 */
 		if (m->m_pkthdr.len < offset + sizeof(struct ip6_hdr))
 			return (m);
-		if (m->m_len < offset + sizeof(struct ip6_hdr))
-			return ng_mss_rewrite_process_safe(priv, m, from_upper);
+		/*
+		 * IPv6 base header guaranteed accessible by NG_MSS_FAST_PATH_MIN_LEN.
+		 * With VLAN: sizeof(ether_header) + ETHER_VLAN_ENCAP_LEN + sizeof(ip6_hdr)
+		 *           = 14 + 4 + 40 = 58 bytes (exactly MIN_LEN)
+		 */
 
 		ip6 = (struct ip6_hdr *)(pkt + offset);
 		ip_hlen = sizeof(struct ip6_hdr);
@@ -465,6 +486,13 @@ ng_mss_rewrite_process_fast(priv_p priv, struct mbuf *m, int from_upper)
 	/* Parse TCP header */
 	if (m->m_pkthdr.len < offset + sizeof(struct tcphdr))
 		return (m);
+	/*
+	 * TCP base header must be checked dynamically.
+	 * With IPv6+VLAN: offset = sizeof(ether_header) + ETHER_VLAN_ENCAP_LEN + sizeof(ip6_hdr)
+	 *                        = 14 + 4 + 40 = 58
+	 * Required: 58 + sizeof(tcphdr) = 58 + 20 = 78 bytes
+	 * This exceeds NG_MSS_FAST_PATH_MIN_LEN (58), so explicit check needed.
+	 */
 	if (m->m_len < offset + sizeof(struct tcphdr))
 		return ng_mss_rewrite_process_safe(priv, m, from_upper);
 
