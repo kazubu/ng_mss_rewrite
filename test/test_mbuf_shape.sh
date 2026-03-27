@@ -129,8 +129,8 @@ run_inject_test() {
 	echo "  Stats: processed=$PROCESSED rewritten=$REWRITTEN"
 	if [ "$DEBUG_STATS_ENABLED" = "1" ]; then
 		# Extract and display debug counters
-		FAST_PATH=$(echo "$STATS" | grep -o 'fast_path_count=[0-9]*' | cut -d= -f2)
-		SAFE_PATH=$(echo "$STATS" | grep -o 'safe_path_count=[0-9]*' | cut -d= -f2)
+		FAST_PATH=$(echo "$STATS" | grep -o 'fast_dispatch_count=[0-9]*' | cut -d= -f2)
+		SAFE_PATH=$(echo "$STATS" | grep -o 'safe_dispatch_count=[0-9]*' | cut -d= -f2)
 		PULLUP=$(echo "$STATS" | grep -o 'pullup_count=[0-9]*' | cut -d= -f2)
 		UNSHARE=$(echo "$STATS" | grep -o 'unshare_count=[0-9]*' | cut -d= -f2)
 		SKIP_OFFLOAD=$(echo "$STATS" | grep -o 'skip_offload=[0-9]*' | cut -d= -f2)
@@ -317,7 +317,7 @@ sleep 0.1
 STATS_CHECK=$(ngctl msg mbuf_test_mss: getstats 2>&1)
 ngctl msg mbuf_test_mss: resetstats >/dev/null 2>&1
 
-if echo "$STATS_CHECK" | grep -q "fast_path_count\|safe_path_count"; then
+if echo "$STATS_CHECK" | grep -q "fast_dispatch_count\|safe_dispatch_count"; then
 	DEBUG_STATS_ENABLED=1
 	echo "Debug statistics: ENABLED"
 else
@@ -330,7 +330,7 @@ echo "=========================================="
 echo "  Test 1: Single Contiguous Mbuf (Baseline)"
 echo "=========================================="
 
-run_inject_test "inject_single" "{ mss=1460 ipv6=0 split_offset=0 csum_flags=0 ext_type=0 }" 1 1 "Single contiguous mbuf, IPv4, MSS rewrite" "fast_path_count" 1
+run_inject_test "inject_single" "{ mss=1460 ipv6=0 split_offset=0 csum_flags=0 ext_type=0 }" 1 1 "Single contiguous mbuf, IPv4, MSS rewrite" "fast_dispatch_count" 1
 
 echo ""
 echo "=========================================="
@@ -340,13 +340,13 @@ echo "=========================================="
 # This is the CRITICAL test for m_copydata() vs direct pointer access
 # Creates multi-mbuf chain where m->m_len < 66 but m_pkthdr.len is full packet
 
-run_inject_test "inject_fragmented" "{ mss=1460 ipv6=0 split_offset=14 csum_flags=0 ext_type=0 }" 1 1 "Fragmented mbuf chain (split at Ether), IPv4, MSS rewrite" "safe_path_count" 1
+run_inject_test "inject_fragmented" "{ mss=1460 ipv6=0 split_offset=14 csum_flags=0 ext_type=0 }" 1 1 "Fragmented mbuf chain (split at Ether), IPv4, MSS rewrite" "safe_dispatch_count" 1
 
 # Test with different split points
-run_inject_test "inject_fragmented" "{ mss=1460 ipv6=0 split_offset=10 csum_flags=0 ext_type=0 }" 1 1 "Fragmented mbuf chain (split at byte 10), IPv4, MSS rewrite" "safe_path_count" 1
+run_inject_test "inject_fragmented" "{ mss=1460 ipv6=0 split_offset=10 csum_flags=0 ext_type=0 }" 1 1 "Fragmented mbuf chain (split at byte 10), IPv4, MSS rewrite" "safe_dispatch_count" 1
 
 # Test IPv6 fragmented
-run_inject_test "inject_fragmented" "{ mss=1460 ipv6=1 split_offset=14 csum_flags=0 ext_type=0 }" 1 1 "Fragmented mbuf chain, IPv6, MSS rewrite" "safe_path_count" 1
+run_inject_test "inject_fragmented" "{ mss=1460 ipv6=1 split_offset=14 csum_flags=0 ext_type=0 }" 1 1 "Fragmented mbuf chain, IPv6, MSS rewrite" "safe_dispatch_count" 1
 
 echo ""
 echo "=========================================="
