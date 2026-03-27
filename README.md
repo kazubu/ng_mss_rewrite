@@ -189,14 +189,8 @@ Args:   { packets_processed=100 packets_rewritten=50
 - `skip_offload`: Skipped due to checksum offload active (upper direction)
 - `skip_mss_ok`: MSS already within limit (no rewrite needed)
 - `skip_no_mss`: No MSS option found in TCP options
-- `skip_not_writable`: Mbuf not writable (should not occur with current code)
-- `skip_too_short`: Packet too short to contain TCP header
-- `skip_not_ip`: Not an IP packet
-- `skip_not_tcp`: Not a TCP packet
-- `skip_fragmented`: IP fragment (not first fragment)
-- `skip_no_syn`: Not a SYN packet
 
-**Note:** Debug statistics have minimal performance overhead but add ~15 counters. Only use for development/testing, not in production.
+**Note:** Debug statistics have minimal performance overhead but add 9 counters. Only use for development/testing, not in production.
 
 ### Statistics Mode Control
 

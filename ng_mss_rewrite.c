@@ -73,15 +73,8 @@ struct ng_mss_stats_percpu {
 	uint64_t	pullup_failed;
 	uint64_t	unshare_count;
 	uint64_t	unshare_failed;
-	/* Skip reasons */
+	/* Skip reasons (only implemented counters) */
 	uint64_t	skip_offload;
-	uint64_t	skip_not_writable;
-	/* Early returns */
-	uint64_t	skip_too_short;
-	uint64_t	skip_not_ip;
-	uint64_t	skip_not_tcp;
-	uint64_t	skip_fragmented;
-	uint64_t	skip_no_syn;
 	uint64_t	skip_no_mss;
 	uint64_t	skip_mss_ok;
 #endif
@@ -111,12 +104,6 @@ struct ng_mss_rewrite_private {
 	uint64_t	baseline_unshare_count;
 	uint64_t	baseline_unshare_failed;
 	uint64_t	baseline_skip_offload;
-	uint64_t	baseline_skip_not_writable;
-	uint64_t	baseline_skip_too_short;
-	uint64_t	baseline_skip_not_ip;
-	uint64_t	baseline_skip_not_tcp;
-	uint64_t	baseline_skip_fragmented;
-	uint64_t	baseline_skip_no_syn;
 	uint64_t	baseline_skip_no_mss;
 	uint64_t	baseline_skip_mss_ok;
 #endif
@@ -155,15 +142,8 @@ struct ng_mss_rewrite_stats {
 	uint64_t	pullup_failed;
 	uint64_t	unshare_count;
 	uint64_t	unshare_failed;
-	/* Skip reasons */
+	/* Skip reasons (only implemented counters) */
 	uint64_t	skip_offload;
-	uint64_t	skip_not_writable;
-	/* Early returns */
-	uint64_t	skip_too_short;
-	uint64_t	skip_not_ip;
-	uint64_t	skip_not_tcp;
-	uint64_t	skip_fragmented;
-	uint64_t	skip_no_syn;
 	uint64_t	skip_no_mss;
 	uint64_t	skip_mss_ok;
 #endif
@@ -201,12 +181,6 @@ static const struct ng_parse_struct_field ng_mss_rewrite_stats_fields[] = {
 	{ "unshare_count",	&ng_parse_uint64_type },
 	{ "unshare_failed",	&ng_parse_uint64_type },
 	{ "skip_offload",	&ng_parse_uint64_type },
-	{ "skip_not_writable",	&ng_parse_uint64_type },
-	{ "skip_too_short",	&ng_parse_uint64_type },
-	{ "skip_not_ip",	&ng_parse_uint64_type },
-	{ "skip_not_tcp",	&ng_parse_uint64_type },
-	{ "skip_fragmented",	&ng_parse_uint64_type },
-	{ "skip_no_syn",	&ng_parse_uint64_type },
 	{ "skip_no_mss",	&ng_parse_uint64_type },
 	{ "skip_mss_ok",	&ng_parse_uint64_type },
 #endif
@@ -1069,8 +1043,8 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 			}
 
 			conf = (struct ng_mss_rewrite_conf *)resp->data;
-			conf->mss_ipv4 = priv->mss_ipv4;
-			conf->mss_ipv6 = priv->mss_ipv6;
+			conf->mss_ipv4 = atomic_load_acq_16(&priv->mss_ipv4);
+			conf->mss_ipv6 = atomic_load_acq_16(&priv->mss_ipv6);
 			break;
 		}
 
@@ -1101,12 +1075,6 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 			stats->unshare_count = 0;
 			stats->unshare_failed = 0;
 			stats->skip_offload = 0;
-			stats->skip_not_writable = 0;
-			stats->skip_too_short = 0;
-			stats->skip_not_ip = 0;
-			stats->skip_not_tcp = 0;
-			stats->skip_fragmented = 0;
-			stats->skip_no_syn = 0;
 			stats->skip_no_mss = 0;
 			stats->skip_mss_ok = 0;
 #endif
@@ -1124,12 +1092,6 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 					stats->unshare_count += priv->stats_percpu[cpu].unshare_count;
 					stats->unshare_failed += priv->stats_percpu[cpu].unshare_failed;
 					stats->skip_offload += priv->stats_percpu[cpu].skip_offload;
-					stats->skip_not_writable += priv->stats_percpu[cpu].skip_not_writable;
-					stats->skip_too_short += priv->stats_percpu[cpu].skip_too_short;
-					stats->skip_not_ip += priv->stats_percpu[cpu].skip_not_ip;
-					stats->skip_not_tcp += priv->stats_percpu[cpu].skip_not_tcp;
-					stats->skip_fragmented += priv->stats_percpu[cpu].skip_fragmented;
-					stats->skip_no_syn += priv->stats_percpu[cpu].skip_no_syn;
 					stats->skip_no_mss += priv->stats_percpu[cpu].skip_no_mss;
 					stats->skip_mss_ok += priv->stats_percpu[cpu].skip_mss_ok;
 #endif
@@ -1147,12 +1109,6 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 			stats->unshare_count -= priv->baseline_unshare_count;
 			stats->unshare_failed -= priv->baseline_unshare_failed;
 			stats->skip_offload -= priv->baseline_skip_offload;
-			stats->skip_not_writable -= priv->baseline_skip_not_writable;
-			stats->skip_too_short -= priv->baseline_skip_too_short;
-			stats->skip_not_ip -= priv->baseline_skip_not_ip;
-			stats->skip_not_tcp -= priv->baseline_skip_not_tcp;
-			stats->skip_fragmented -= priv->baseline_skip_fragmented;
-			stats->skip_no_syn -= priv->baseline_skip_no_syn;
 			stats->skip_no_mss -= priv->baseline_skip_no_mss;
 			stats->skip_mss_ok -= priv->baseline_skip_mss_ok;
 #endif
@@ -1174,10 +1130,8 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 			uint64_t total_fast_path = 0, total_safe_path = 0;
 			uint64_t total_pullup = 0, total_pullup_failed = 0;
 			uint64_t total_unshare = 0, total_unshare_failed = 0;
-			uint64_t total_skip_offload = 0, total_skip_not_writable = 0;
-			uint64_t total_skip_too_short = 0, total_skip_not_ip = 0;
-			uint64_t total_skip_not_tcp = 0, total_skip_fragmented = 0;
-			uint64_t total_skip_no_syn = 0, total_skip_no_mss = 0, total_skip_mss_ok = 0;
+			uint64_t total_skip_offload = 0;
+			uint64_t total_skip_no_mss = 0, total_skip_mss_ok = 0;
 #endif
 
 			/* Lock to prevent race with getstats */
@@ -1196,12 +1150,6 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 					total_unshare += priv->stats_percpu[cpu].unshare_count;
 					total_unshare_failed += priv->stats_percpu[cpu].unshare_failed;
 					total_skip_offload += priv->stats_percpu[cpu].skip_offload;
-					total_skip_not_writable += priv->stats_percpu[cpu].skip_not_writable;
-					total_skip_too_short += priv->stats_percpu[cpu].skip_too_short;
-					total_skip_not_ip += priv->stats_percpu[cpu].skip_not_ip;
-					total_skip_not_tcp += priv->stats_percpu[cpu].skip_not_tcp;
-					total_skip_fragmented += priv->stats_percpu[cpu].skip_fragmented;
-					total_skip_no_syn += priv->stats_percpu[cpu].skip_no_syn;
 					total_skip_no_mss += priv->stats_percpu[cpu].skip_no_mss;
 					total_skip_mss_ok += priv->stats_percpu[cpu].skip_mss_ok;
 #endif
@@ -1218,12 +1166,6 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 			priv->baseline_unshare_count = total_unshare;
 			priv->baseline_unshare_failed = total_unshare_failed;
 			priv->baseline_skip_offload = total_skip_offload;
-			priv->baseline_skip_not_writable = total_skip_not_writable;
-			priv->baseline_skip_too_short = total_skip_too_short;
-			priv->baseline_skip_not_ip = total_skip_not_ip;
-			priv->baseline_skip_not_tcp = total_skip_not_tcp;
-			priv->baseline_skip_fragmented = total_skip_fragmented;
-			priv->baseline_skip_no_syn = total_skip_no_syn;
 			priv->baseline_skip_no_mss = total_skip_no_mss;
 			priv->baseline_skip_mss_ok = total_skip_mss_ok;
 #endif
@@ -1271,7 +1213,7 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 
 			mode_conf = (struct ng_mss_rewrite_stats_mode *)resp->data;
 #if ENABLE_STATS
-			mode_conf->mode = priv->stats_mode;
+			mode_conf->mode = atomic_load_acq_8(&priv->stats_mode);
 #else
 			mode_conf->mode = STATS_MODE_DISABLED;
 #endif
@@ -1304,8 +1246,8 @@ ng_mss_rewrite_rcvmsg(node_p node, item_p item, hook_p lasthook)
 			}
 
 			dir_conf = (struct ng_mss_rewrite_direction *)resp->data;
-			dir_conf->enable_lower = priv->enable_lower;
-			dir_conf->enable_upper = priv->enable_upper;
+			dir_conf->enable_lower = atomic_load_acq_8(&priv->enable_lower);
+			dir_conf->enable_upper = atomic_load_acq_8(&priv->enable_upper);
 			break;
 		}
 
