@@ -1,0 +1,16 @@
+# Build artifacts
+*.o
+*.ko
+*.pieo
+*.bco
+*.llo
+*.debug
+*.full
+*.bc
+*.ll
+ng_builder_generic
+
+# Backup files
+*.bak
+*.swp
+*~
