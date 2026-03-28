@@ -4,7 +4,8 @@
  *
  * Usage:
  *   ng_builder_generic simple        # Basic: socket -> mss_rewrite
- *   ng_builder_generic mbuf          # Mbuf test: inject -> mss -> hole
+ *   ng_builder_generic mbuf          # Mbuf test: inject -> mss:lower -> hole (lower→upper)
+ *   ng_builder_generic mbuf_upper    # Upper test: source -> mss:upper -> hole (upper→lower)
  *   ng_builder_generic wire_verify   # Wire verify: inject <-> mss (loop)
  *   ng_builder_generic test          # Test/bench: source -> mss -> hole (prefix=test)
  *   ng_builder_generic fuzz          # Fuzz test: source -> mss -> hole (prefix=fuzz)
@@ -24,6 +25,7 @@
 /* Topology builder functions */
 static void build_simple_topology(int cs);
 static void build_mbuf_topology(int cs);
+static void build_mbuf_upper_topology(int cs);
 static void build_wire_verify_topology(int cs);
 static void build_bench_topology(int cs, const char *prefix);
 
@@ -56,6 +58,8 @@ main(int argc, char *argv[])
 		build_simple_topology(cs);
 	} else if (strcmp(topology, "mbuf") == 0) {
 		build_mbuf_topology(cs);
+	} else if (strcmp(topology, "mbuf_upper") == 0) {
+		build_mbuf_upper_topology(cs);
 	} else if (strcmp(topology, "wire_verify") == 0) {
 		build_wire_verify_topology(cs);
 	} else if (strcmp(topology, "test") == 0) {
@@ -64,7 +68,7 @@ main(int argc, char *argv[])
 		build_bench_topology(cs, "fuzz");
 	} else {
 		fprintf(stderr, "Unknown topology type: %s\n", topology);
-		fprintf(stderr, "Valid types: simple, mbuf, wire_verify, test, fuzz\n");
+		fprintf(stderr, "Valid types: simple, mbuf, mbuf_upper, wire_verify, test, fuzz\n");
 		close(cs);
 		close(ds);
 		exit(1);
@@ -122,6 +126,38 @@ build_mbuf_topology(int cs)
 
 	printf("\nFinal: mbuf_test_inject:output <-> mbuf_test_mss:lower\n");
 	printf("                                    mbuf_test_mss:upper <-> mbuf_test_hole:data\n");
+}
+
+/*
+ * Build upper direction test topology: inject:output -> mss:upper -> mss:lower -> hole
+ * For testing upper→lower direction with offload flags
+ */
+static void
+build_mbuf_upper_topology(int cs)
+{
+	printf("Creating: mbuf_inject -> mss_rewrite:upper -> mss:lower -> hole\n");
+	printf("Strategy: Build chain for upper→lower direction testing\n\n");
+
+	/* Step 1: socket -> mss_rewrite (temporary anchor via lower hook) */
+	ng_mkpeer_node(cs, ".", "mss_rewrite", "hook1", "lower", "mbuf_upper_mss");
+	printf("Created mss_rewrite node: mbuf_upper_mss\n");
+
+	/* Step 2: mss_rewrite:upper -> mbuf_inject */
+	ng_mkpeer_node(cs, "mbuf_upper_mss:", "mbuf_inject", "upper", "output",
+	    "mbuf_upper_inject");
+	printf("Created mbuf_inject node: mbuf_upper_inject\n");
+
+	/* Step 3: Disconnect socket from mss_rewrite */
+	ng_disconnect_hook(cs, ".", "hook1");
+	printf("Disconnected socket from mss_rewrite\n");
+
+	/* Step 4: mss_rewrite:lower -> hole */
+	ng_mkpeer_node(cs, "mbuf_upper_mss:", "hole", "lower", "data",
+	    "mbuf_upper_hole");
+	printf("Created hole node: mbuf_upper_hole\n");
+
+	printf("\nFinal: mbuf_upper_inject:output <-> mbuf_upper_mss:upper\n");
+	printf("                                     mbuf_upper_mss:lower <-> mbuf_upper_hole:data\n");
 }
 
 /*

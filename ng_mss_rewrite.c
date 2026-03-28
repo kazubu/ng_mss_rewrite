@@ -616,7 +616,7 @@ ng_mss_rewrite_process_fast(priv_p priv, struct mbuf *m, int from_upper)
 	}
 
 	/* Checksum offload check for upper direction */
-	if (from_upper && (m->m_pkthdr.csum_flags & (CSUM_TCP | CSUM_TSO))) {
+	if (from_upper && (m->m_pkthdr.csum_flags & (CSUM_IP_TCP | CSUM_IP_TSO | CSUM_IP6_TCP | CSUM_IP6_TSO))) {
 #if ENABLE_STATS && ENABLE_DEBUG_STATS
 		if (atomic_load_acq_8(&priv->stats_mode) == STATS_MODE_PERCPU)
 			counter_u64_add(priv->skip_offload, 1);
@@ -913,7 +913,7 @@ found_mss:
 	 * not a complete checksum. We cannot safely adjust it incrementally.
 	 */
 	if (from_upper) {
-		if (m->m_pkthdr.csum_flags & (CSUM_TCP | CSUM_TSO)) {
+		if (m->m_pkthdr.csum_flags & (CSUM_IP_TCP | CSUM_IP_TSO | CSUM_IP6_TCP | CSUM_IP6_TSO)) {
 			/* Checksum offload active, skip rewrite */
 #if ENABLE_STATS && ENABLE_DEBUG_STATS
 			if (atomic_load_acq_8(&priv->stats_mode) == STATS_MODE_PERCPU)

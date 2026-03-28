@@ -292,6 +292,11 @@ inject_single(priv_p priv, struct ng_mbuf_inject_params *params)
 	if (m == NULL)
 		return (ENOMEM);
 
+	/* Set checksum offload flags if requested */
+	if (params->csum_flags != 0) {
+		m->m_pkthdr.csum_flags = params->csum_flags;
+	}
+
 	/* Send to output hook */
 	if (priv->output != NULL) {
 		NG_SEND_DATA_ONLY(error, priv->output, m);
