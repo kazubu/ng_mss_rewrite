@@ -9,6 +9,7 @@
  *   ng_builder_generic wire_verify   # Wire verify: inject <-> mss (loop)
  *   ng_builder_generic test          # Test/bench: source -> mss -> hole (prefix=test)
  *   ng_builder_generic fuzz          # Fuzz test: source -> mss -> hole (prefix=fuzz)
+ *   ng_builder_generic reconfig      # Reconfig test: source -> mss -> hole (prefix=reconfig)
  */
 
 #include <sys/types.h>
@@ -66,9 +67,11 @@ main(int argc, char *argv[])
 		build_bench_topology(cs, "test");
 	} else if (strcmp(topology, "fuzz") == 0) {
 		build_bench_topology(cs, "fuzz");
+	} else if (strcmp(topology, "reconfig") == 0) {
+		build_bench_topology(cs, "reconfig");
 	} else {
 		fprintf(stderr, "Unknown topology type: %s\n", topology);
-		fprintf(stderr, "Valid types: simple, mbuf, mbuf_upper, wire_verify, test, fuzz\n");
+		fprintf(stderr, "Valid types: simple, mbuf, mbuf_upper, wire_verify, test, fuzz, reconfig\n");
 		close(cs);
 		close(ds);
 		exit(1);
