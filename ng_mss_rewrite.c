@@ -405,6 +405,56 @@ ng_mss_rewrite_process(priv_p priv, struct mbuf *m, int from_upper)
 }
 
 /*
+ * Helper: Scan TCP options to find MSS option offset
+ * Returns the byte offset of the MSS option within the options buffer,
+ * or -1 if not found.
+ *
+ * This function handles:
+ * - EOL (End of Option List)
+ * - NOP (No Operation) padding
+ * - Variable-length options with proper bounds checking
+ * - MSS option identification (type=2, length=4)
+ */
+static int
+find_tcp_mss_offset(const uint8_t *options, int opt_len)
+{
+	int i, opt_type, opt_size;
+
+	for (i = 0; i < opt_len; ) {
+		opt_type = options[i];
+
+		/* End of options */
+		if (opt_type == TCPOPT_EOL)
+			break;
+
+		/* NOP padding - single byte */
+		if (opt_type == TCPOPT_NOP) {
+			i++;
+			continue;
+		}
+
+		/* Need at least 2 bytes for option header (type + length) */
+		if (i + 1 >= opt_len)
+			break;
+
+		opt_size = options[i + 1];
+
+		/* Validate option length */
+		if (opt_size < 2 || i + opt_size > opt_len)
+			break;
+
+		/* Found MSS option (type=2, length=4) */
+		if (opt_type == TCPOPT_MAXSEG && opt_size == 4)
+			return (i);
+
+		/* Move to next option */
+		i += opt_size;
+	}
+
+	return (-1);
+}
+
+/*
  * Fast path: Process packet with direct pointer access
  * Assumes m->m_len >= NG_MSS_FAST_PATH_MIN_LEN
  * (sufficient for Ethernet + VLAN + IPv6 base header)
@@ -419,7 +469,7 @@ ng_mss_rewrite_process_fast(priv_p priv, struct mbuf *m, int from_upper)
 	struct tcphdr *tcp;
 	uint8_t *options, *pkt;
 	uint16_t ether_type, max_mss, old_mss, plen;
-	int offset, ip_hlen, tcp_hlen, opt_len, mss_offset, i;
+	int offset, ip_hlen, tcp_hlen, opt_len, mss_offset;
 
 	/* Fast path: ensure minimum packet length */
 	if (m->m_pkthdr.len < sizeof(struct ether_header) + sizeof(struct ip) + sizeof(struct tcphdr))
@@ -572,30 +622,8 @@ ng_mss_rewrite_process_fast(priv_p priv, struct mbuf *m, int from_upper)
 	           options[2] == TCPOPT_MAXSEG && options[3] == 4) {
 		mss_offset = 2;
 	} else {
-		/* Slow path: walk options */
-		for (i = 0; i < opt_len; ) {
-			uint8_t opt_type = options[i];
-			uint8_t opt_size;
-
-			if (opt_type == TCPOPT_EOL)
-				break;
-			if (opt_type == TCPOPT_NOP) {
-				i++;
-				continue;
-			}
-			if (i + 1 >= opt_len)
-				break;
-
-			opt_size = options[i + 1];
-			if (opt_size < 2 || i + opt_size > opt_len)
-				break;
-
-			if (opt_type == TCPOPT_MAXSEG && opt_size == 4) {
-				mss_offset = i;
-				break;
-			}
-			i += opt_size;
-		}
+		/* Slow path: walk options using helper */
+		mss_offset = find_tcp_mss_offset(options, opt_len);
 	}
 
 	if (mss_offset < 0) {
@@ -677,7 +705,7 @@ ng_mss_rewrite_process_safe(priv_p priv, struct mbuf *m, int from_upper, int fro
 	/* Parsing state */
 	uint16_t ether_type, max_mss, old_mss, plen;
 	int offset, ip_hlen, tcp_hlen, opt_len, mss_offset;
-	int i, is_ipv4;
+	int is_ipv4;
 
 	/* Fast path: ensure minimum packet length */
 	if (m->m_pkthdr.len < sizeof(struct ether_header) + sizeof(struct ip) + sizeof(struct tcphdr))
@@ -842,58 +870,35 @@ ng_mss_rewrite_process_safe(priv_p priv, struct mbuf *m, int from_upper, int fro
 		/* Case 1: MSS at beginning (offset 0) */
 		if (tcp_opts[0] == TCPOPT_MAXSEG && tcp_opts[1] == 4) {
 			mss_offset = 0;
-			goto found_mss;
 		}
 		/* Case 2: NOP + MSS (offset 1) */
-		if (opt_len >= 5 && tcp_opts[0] == TCPOPT_NOP &&
+		else if (opt_len >= 5 && tcp_opts[0] == TCPOPT_NOP &&
 		    tcp_opts[1] == TCPOPT_MAXSEG && tcp_opts[2] == 4) {
 			mss_offset = 1;
-			goto found_mss;
 		}
 		/* Case 3: NOP + NOP + MSS (offset 2) */
-		if (opt_len >= 6 && tcp_opts[0] == TCPOPT_NOP &&
+		else if (opt_len >= 6 && tcp_opts[0] == TCPOPT_NOP &&
 		    tcp_opts[1] == TCPOPT_NOP && tcp_opts[2] == TCPOPT_MAXSEG && tcp_opts[3] == 4) {
 			mss_offset = 2;
-			goto found_mss;
 		}
+		/* Case 4: Use helper function for all other cases */
+		else {
+			mss_offset = find_tcp_mss_offset(tcp_opts, opt_len);
+		}
+	} else {
+		/* Options too short for MSS, use helper to be safe */
+		mss_offset = find_tcp_mss_offset(tcp_opts, opt_len);
 	}
 
-	/* Slow path: walk options generically */
-	for (i = 0; i < opt_len; ) {
-		uint8_t opt_type = tcp_opts[i];
-		uint8_t opt_size;
-
-		if (opt_type == TCPOPT_EOL)
-			break;
-
-		if (opt_type == TCPOPT_NOP) {
-			i++;
-			continue;
-		}
-
-		if (i + 1 >= opt_len)
-			break;
-
-		opt_size = tcp_opts[i + 1];
-		if (opt_size < 2 || i + opt_size > opt_len)
-			break;
-
-		if (opt_type == TCPOPT_MAXSEG && opt_size == 4) {
-			mss_offset = i;
-			goto found_mss;
-		}
-
-		i += opt_size;
-	}
-
-	/* MSS option not found */
+	if (mss_offset < 0) {
+		/* MSS option not found */
 #if ENABLE_STATS && ENABLE_DEBUG_STATS
-	if (atomic_load_acq_8(&priv->stats_mode) == STATS_MODE_PERCPU)
-		counter_u64_add(priv->skip_no_mss, 1);
+		if (atomic_load_acq_8(&priv->stats_mode) == STATS_MODE_PERCPU)
+			counter_u64_add(priv->skip_no_mss, 1);
 #endif
-	return (m);
+		return (m);
+	}
 
-found_mss:
 	/* Extract MSS value */
 	old_mss = (tcp_opts[mss_offset + 2] << 8) | tcp_opts[mss_offset + 3];
 
