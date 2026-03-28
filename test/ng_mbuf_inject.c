@@ -30,8 +30,14 @@
 /* Node private data */
 struct ng_mbuf_inject_private {
 	hook_p	output;		/* Output hook */
+	hook_p	input;		/* Input hook for packet verification */
 	u_long	packets_sent;	/* Statistics */
 	struct mbuf *held_mbuf;	/* Held mbuf for shared test (keeps refcount > 1) */
+	/* Last received packet info (for wire image verification) */
+	uint8_t	last_valid;	/* 1 if last_* fields are valid */
+	uint16_t last_mss;	/* MSS value from last received packet */
+	uint16_t last_checksum;	/* TCP checksum from last received packet */
+	uint8_t	last_ipv6;	/* 0=IPv4, 1=IPv6 */
 };
 typedef struct ng_mbuf_inject_private *priv_p;
 
@@ -44,6 +50,7 @@ enum {
 	NGM_MBUF_INJECT_OFFLOAD,	/* Send packet with checksum offload flags */
 	NGM_MBUF_INJECT_IPV6EXT,	/* Send IPv6 packet with extension headers */
 	NGM_MBUF_INJECT_GETSTATS,	/* Get statistics */
+	NGM_MBUF_INJECT_GETLASTPKT,	/* Get last received packet info */
 };
 
 /* Message structures */
@@ -59,11 +66,19 @@ struct ng_mbuf_inject_stats {
 	u_long packets_sent;
 };
 
+struct ng_mbuf_inject_lastpkt {
+	uint8_t	 valid;		/* 1 if packet info is valid */
+	uint16_t mss;		/* MSS value from TCP options */
+	uint16_t checksum;	/* TCP checksum */
+	uint8_t	 ipv6;		/* 0=IPv4, 1=IPv6 */
+};
+
 /* Netgraph type descriptor */
 static ng_constructor_t	ng_mbuf_inject_constructor;
 static ng_rcvmsg_t	ng_mbuf_inject_rcvmsg;
 static ng_shutdown_t	ng_mbuf_inject_shutdown;
 static ng_newhook_t	ng_mbuf_inject_newhook;
+static ng_rcvdata_t	ng_mbuf_inject_rcvdata;
 static ng_disconnect_t	ng_mbuf_inject_disconnect;
 
 /* Parse types */
@@ -87,6 +102,18 @@ static const struct ng_parse_struct_field ng_mbuf_inject_stats_type_fields[] = {
 static const struct ng_parse_type ng_mbuf_inject_stats_type = {
 	&ng_parse_struct_type,
 	&ng_mbuf_inject_stats_type_fields
+};
+
+static const struct ng_parse_struct_field ng_mbuf_inject_lastpkt_type_fields[] = {
+	{ "valid",	&ng_parse_uint8_type	},
+	{ "mss",	&ng_parse_uint16_type	},
+	{ "checksum",	&ng_parse_uint16_type	},
+	{ "ipv6",	&ng_parse_uint8_type	},
+	{ NULL }
+};
+static const struct ng_parse_type ng_mbuf_inject_lastpkt_type = {
+	&ng_parse_struct_type,
+	&ng_mbuf_inject_lastpkt_type_fields
 };
 
 /* Command list */
@@ -133,6 +160,13 @@ static const struct ng_cmdlist ng_mbuf_inject_cmdlist[] = {
 		NULL,
 		&ng_mbuf_inject_stats_type
 	},
+	{
+		NGM_MBUF_INJECT_COOKIE,
+		NGM_MBUF_INJECT_GETLASTPKT,
+		"getlastpkt",
+		NULL,
+		&ng_mbuf_inject_lastpkt_type
+	},
 	{ 0 }
 };
 
@@ -144,6 +178,7 @@ static struct ng_type ng_mbuf_inject_typestruct = {
 	.rcvmsg =	ng_mbuf_inject_rcvmsg,
 	.shutdown =	ng_mbuf_inject_shutdown,
 	.newhook =	ng_mbuf_inject_newhook,
+	.rcvdata =	ng_mbuf_inject_rcvdata,
 	.disconnect =	ng_mbuf_inject_disconnect,
 	.cmdlist =	ng_mbuf_inject_cmdlist,
 };
@@ -630,6 +665,24 @@ ng_mbuf_inject_rcvmsg(node_p node, item_p item, hook_p lasthook)
 			break;
 		}
 
+		case NGM_MBUF_INJECT_GETLASTPKT:
+		{
+			struct ng_mbuf_inject_lastpkt *lastpkt;
+
+			NG_MKRESPONSE(resp, msg, sizeof(*lastpkt), M_NOWAIT);
+			if (resp == NULL) {
+				error = ENOMEM;
+				break;
+			}
+
+			lastpkt = (struct ng_mbuf_inject_lastpkt *)resp->data;
+			lastpkt->valid = priv->last_valid;
+			lastpkt->mss = priv->last_mss;
+			lastpkt->checksum = priv->last_checksum;
+			lastpkt->ipv6 = priv->last_ipv6;
+			break;
+		}
+
 		default:
 			error = EINVAL;
 			break;
@@ -656,6 +709,8 @@ ng_mbuf_inject_newhook(node_p node, hook_p hook, const char *name)
 
 	if (strcmp(name, "output") == 0) {
 		priv->output = hook;
+	} else if (strcmp(name, "input") == 0) {
+		priv->input = hook;
 	} else {
 		return (EINVAL);
 	}
@@ -673,10 +728,161 @@ ng_mbuf_inject_disconnect(hook_p hook)
 
 	if (hook == priv->output)
 		priv->output = NULL;
+	else if (hook == priv->input)
+		priv->input = NULL;
 
 	if (NG_NODE_NUMHOOKS(NG_HOOK_NODE(hook)) == 0)
 		ng_rmnode_self(NG_HOOK_NODE(hook));
 
+	return (0);
+}
+
+/*
+ * Receive data packet (for wire image verification)
+ */
+static int
+ng_mbuf_inject_rcvdata(hook_p hook, item_p item)
+{
+	priv_p priv = NG_NODE_PRIVATE(NG_HOOK_NODE(hook));
+	struct mbuf *m;
+	uint8_t buf[128];
+	int copied, ether_type_offset;
+	uint16_t ether_type;
+	int ip_hdr_offset, ip_hdr_len;
+	uint8_t ip_proto;
+	int tcp_hdr_offset, tcp_hdr_len;
+	uint16_t tcp_checksum;
+	uint8_t *tcp_opts;
+	int tcp_opts_len;
+	int i;
+	uint16_t mss_value = 0;
+	uint8_t mss_found = 0;
+	uint8_t is_ipv6;
+
+	NGI_GET_M(item, m);
+	NG_FREE_ITEM(item);
+
+	/* Clear last packet info */
+	priv->last_valid = 0;
+
+	/* Copy first part of packet for parsing */
+	if (m->m_pkthdr.len < 66) {
+		/* Too short to be valid TCP packet */
+		m_freem(m);
+		return (0);
+	}
+
+	copied = (m->m_pkthdr.len < sizeof(buf)) ? m->m_pkthdr.len : sizeof(buf);
+	m_copydata(m, 0, copied, buf);
+
+	/* Parse Ethernet header (14 bytes) */
+	ether_type_offset = 12;
+	ether_type = (buf[ether_type_offset] << 8) | buf[ether_type_offset + 1];
+
+	/* Determine IP version and parse IP header */
+	ip_hdr_offset = 14;
+	if (ether_type == ETHERTYPE_IP) {
+		/* IPv4 */
+		is_ipv6 = 0;
+		if (copied < ip_hdr_offset + 20) {
+			m_freem(m);
+			return (0);
+		}
+		ip_hdr_len = (buf[ip_hdr_offset] & 0x0f) * 4;
+		ip_proto = buf[ip_hdr_offset + 9];
+		tcp_hdr_offset = ip_hdr_offset + ip_hdr_len;
+	} else if (ether_type == ETHERTYPE_IPV6) {
+		/* IPv6 */
+		is_ipv6 = 1;
+		if (copied < ip_hdr_offset + 40) {
+			m_freem(m);
+			return (0);
+		}
+		/* For simplicity, assume no extension headers for now */
+		/* In real verification, would need to skip extension headers */
+		ip_proto = buf[ip_hdr_offset + 6];
+		tcp_hdr_offset = ip_hdr_offset + 40;
+	} else {
+		/* Unknown protocol */
+		m_freem(m);
+		return (0);
+	}
+
+	/* Check if TCP */
+	if (ip_proto != IPPROTO_TCP) {
+		m_freem(m);
+		return (0);
+	}
+
+	/* Parse TCP header */
+	if (copied < tcp_hdr_offset + 20) {
+		m_freem(m);
+		return (0);
+	}
+
+	/* Extract TCP header length (in 32-bit words) */
+	tcp_hdr_len = ((buf[tcp_hdr_offset + 12] >> 4) & 0x0f) * 4;
+
+	/* Extract TCP checksum (offset 16-17 in TCP header) */
+	tcp_checksum = (buf[tcp_hdr_offset + 16] << 8) | buf[tcp_hdr_offset + 17];
+
+	/* Parse TCP options to find MSS */
+	if (tcp_hdr_len > 20) {
+		tcp_opts = &buf[tcp_hdr_offset + 20];
+		tcp_opts_len = tcp_hdr_len - 20;
+
+		if (copied < tcp_hdr_offset + tcp_hdr_len) {
+			/* Options extend beyond what we copied */
+			m_freem(m);
+			return (0);
+		}
+
+		/* Scan TCP options */
+		i = 0;
+		while (i < tcp_opts_len) {
+			uint8_t kind = tcp_opts[i];
+
+			if (kind == 0) {
+				/* TCPOPT_EOL - End of option list */
+				break;
+			} else if (kind == 1) {
+				/* TCPOPT_NOP - No operation */
+				i++;
+				continue;
+			}
+
+			/* Other options have length field */
+			if (i + 1 >= tcp_opts_len) {
+				/* Malformed options */
+				break;
+			}
+
+			uint8_t len = tcp_opts[i + 1];
+			if (len < 2 || i + len > tcp_opts_len) {
+				/* Invalid length */
+				break;
+			}
+
+			if (kind == 2 && len == 4) {
+				/* TCPOPT_MAXSEG - MSS option */
+				mss_value = (tcp_opts[i + 2] << 8) | tcp_opts[i + 3];
+				mss_found = 1;
+				break;
+			}
+
+			i += len;
+		}
+	}
+
+	/* Store packet info if MSS was found */
+	if (mss_found) {
+		priv->last_valid = 1;
+		priv->last_mss = mss_value;
+		priv->last_checksum = tcp_checksum;
+		priv->last_ipv6 = is_ipv6;
+	}
+
+	m_freem(m);
 	return (0);
 }
 

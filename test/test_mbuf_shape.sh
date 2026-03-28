@@ -231,18 +231,18 @@ if ngctl show mbuf_test_inject: >/dev/null 2>&1; then
 	sleep 1
 fi
 
-# Build ng_builder_mbuf if needed
-if [ ! -f "./ng_builder_mbuf" ]; then
-	echo "Building ng_builder_mbuf..."
-	make ng_builder_mbuf || {
-		echo "ERROR: Failed to build ng_builder_mbuf"
+# Build ng_builder_generic if needed
+if [ ! -f "./ng_builder_generic" ]; then
+	echo "Building ng_builder_generic..."
+	make ng_builder_generic || {
+		echo "ERROR: Failed to build ng_builder_generic"
 		exit 1
 	}
 fi
 
 # Start topology builder in background
 echo "Starting topology builder..."
-./ng_builder_mbuf &
+./ng_builder_generic mbuf &
 BUILDER_PID=$!
 
 # Wait for topology to be created

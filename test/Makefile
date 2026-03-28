@@ -1,9 +1,8 @@
-PROG=	ng_builder
-SRCS=	ng_builder.c
+# Generic netgraph topology builder
+# Replaces old ng_builder, ng_builder_mbuf, and ng_builder_wire_verify
+
+PROG=	ng_builder_generic
+SRCS=	ng_builder_generic.c
 LDADD=	-lnetgraph
 
 .include <bsd.prog.mk>
-
-# Additional target for ng_builder_mbuf
-ng_builder_mbuf: ng_builder_mbuf.c
-	${CC} ${CFLAGS} -o ng_builder_mbuf ng_builder_mbuf.c -lnetgraph

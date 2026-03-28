@@ -47,7 +47,7 @@ cleanup() {
 
     # Kill ng_builder processes
     pkill -f "ng_builder test" 2>/dev/null
-    pkill -f ng_builder 2>/dev/null
+    pkill -f "ng_builder_generic test" 2>&1 || true; pkill -f ng_builder 2>/dev/null
     sleep 1
 
     # Shutdown nodes in correct order (disconnect first, then shutdown)
@@ -117,19 +117,19 @@ setup() {
     echo "Module loaded successfully"
 
     # Build ng_builder if needed
-    if [ ! -f "$SCRIPT_DIR/ng_builder" ]; then
-        echo "Building ng_builder..."
+    if [ ! -f "$SCRIPT_DIR/ng_builder_generic" ]; then
+        echo "Building ng_builder_generic..."
         cd "$SCRIPT_DIR" && make || return 1
     fi
 
     # Start topology with "test" prefix
-    $SCRIPT_DIR/ng_builder test > /tmp/ng_builder_test.log 2>&1 &
+    $SCRIPT_DIR/ng_builder_generic test > /tmp/ng_builder_test.log 2>&1 &
     NG_BUILDER_PID=$!
     sleep 2
 
     # Verify ng_builder is still running
     if ! ps -p $NG_BUILDER_PID > /dev/null 2>&1; then
-        echo "ERROR: ng_builder exited unexpectedly"
+        echo "ERROR: ng_builder_generic exited unexpectedly"
         cat /tmp/ng_builder_test.log
         return 1
     fi
