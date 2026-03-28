@@ -13,6 +13,9 @@ fi
 SCRIPT_DIR=$(dirname "$(realpath "$0")")
 PROJECT_ROOT=$(dirname "$SCRIPT_DIR")
 
+# Source test helper functions
+. "${SCRIPT_DIR}/test_helpers.sh"
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -48,16 +51,12 @@ cleanup() {
     # Kill ng_builder processes
     pkill -f "ng_builder test" 2>/dev/null
     pkill -f "ng_builder_generic test" 2>&1 || true; pkill -f ng_builder 2>/dev/null
-    sleep 1
 
     # Shutdown nodes in correct order (disconnect first, then shutdown)
     ngctl msg test_source: clrdata 2>/dev/null || true
     ngctl shutdown test_source: 2>/dev/null || true
     ngctl shutdown test_mss: 2>/dev/null || true
     ngctl shutdown test_hole: 2>/dev/null || true
-
-    # Wait a bit for cleanup to complete
-    sleep 1
 
     # Verify cleanup
     if ngctl list 2>/dev/null | grep -q "test_"; then
@@ -68,7 +67,6 @@ cleanup() {
         for node in test_source test_mss test_hole; do
             ngctl shutdown ${node}: 2>/dev/null || true
         done
-        sleep 1
     fi
 }
 
@@ -86,7 +84,7 @@ setup() {
             echo "ERROR: Failed to unload ng_mss_rewrite (may be in use)"
             return 1
         }
-        sleep 1
+        wait_for_module_unload ng_mss_rewrite 2 || true
     fi
 
     # Ensure dependencies are loaded
@@ -125,18 +123,17 @@ setup() {
     # Start topology with "test" prefix
     $SCRIPT_DIR/ng_builder_generic test > /tmp/ng_builder_test.log 2>&1 &
     NG_BUILDER_PID=$!
-    sleep 2
 
-    # Verify ng_builder is still running
-    if ! ps -p $NG_BUILDER_PID > /dev/null 2>&1; then
-        echo "ERROR: ng_builder_generic exited unexpectedly"
+    # Wait for topology nodes to be created
+    if ! wait_for_nodes 5 test_source: test_mss: test_hole:; then
+        echo "ERROR: Timeout waiting for test topology nodes to be created"
         cat /tmp/ng_builder_test.log
         return 1
     fi
 
-    # Verify topology
-    if ! ngctl list 2>/dev/null | grep -q "test_mss"; then
-        echo "ERROR: Failed to create test topology"
+    # Verify ng_builder is still running
+    if ! ps -p $NG_BUILDER_PID > /dev/null 2>&1; then
+        echo "ERROR: ng_builder_generic exited unexpectedly"
         cat /tmp/ng_builder_test.log
         return 1
     fi
@@ -174,7 +171,12 @@ send_packet() {
 
     # Start transmission
     ngctl msg test_source: start 1 2>/dev/null
-    sleep 1
+
+    # Poll for packet to be processed (wait for processed counter to reach expected value)
+    if ! wait_for_packets_processed test_mss: $EXPECT_PROCESSED 2; then
+        # If timeout, continue anyway - some tests expect 0 packets processed
+        :
+    fi
 
     # Get stats
     STATS=$(ngctl msg test_mss: getstats 2>/dev/null)

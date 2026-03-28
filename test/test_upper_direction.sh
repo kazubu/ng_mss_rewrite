@@ -21,6 +21,9 @@ cd "$SCRIPT_DIR" || {
 	exit 1
 }
 
+# Source test helper functions
+. "${SCRIPT_DIR}/test_helpers.sh"
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -46,7 +49,6 @@ cleanup() {
 	ngctl shutdown mbuf_upper_inject: 2>/dev/null || true
 	# Kill any stray processes
 	pkill -f "ng_builder_generic mbuf_upper" 2>/dev/null || true
-	sleep 1
 }
 
 # Trap cleanup on exit
@@ -88,7 +90,12 @@ run_inject_test() {
 
 	# Execute inject command
 	ngctl msg mbuf_upper_inject: inject_single "$params" >/dev/null 2>&1
-	sleep 0.1
+
+	# Poll for packet to be sent
+	if ! wait_for_packet_sent mbuf_upper_inject: $SENT_BEFORE 1; then
+		fail_test "$test_name (packet injection timed out)"
+		return 1
+	fi
 
 	# Get stats after
 	STATS=$(ngctl msg mbuf_upper_mss: getstats 2>&1)
@@ -164,7 +171,13 @@ echo "Starting topology builder (mbuf_upper)..."
 BUILDER_PID=$!
 
 # Wait for topology to be created
-sleep 3
+if ! wait_for_nodes 5 mbuf_upper_inject: mbuf_upper_mss: mbuf_upper_hole:; then
+	echo "ERROR: Timeout waiting for topology nodes to be created"
+	kill $BUILDER_PID 2>/dev/null || true
+	echo "Available nodes:"
+	ngctl list
+	exit 1
+fi
 
 # Check if builder process is still running
 if ! kill -0 $BUILDER_PID 2>/dev/null; then
@@ -173,31 +186,6 @@ if ! kill -0 $BUILDER_PID 2>/dev/null; then
 	exit 1
 fi
 echo "Builder process running (PID: $BUILDER_PID)"
-
-# Verify nodes exist
-if ! ngctl show mbuf_upper_inject: >/dev/null 2>&1; then
-	echo "ERROR: mbuf_upper_inject node not found"
-	kill $BUILDER_PID 2>/dev/null || true
-	echo "Available nodes:"
-	ngctl list
-	exit 1
-fi
-
-if ! ngctl show mbuf_upper_mss: >/dev/null 2>&1; then
-	echo "ERROR: mbuf_upper_mss node not found"
-	kill $BUILDER_PID 2>/dev/null || true
-	echo "Available nodes:"
-	ngctl list
-	exit 1
-fi
-
-if ! ngctl show mbuf_upper_hole: >/dev/null 2>&1; then
-	echo "ERROR: mbuf_upper_hole node not found"
-	kill $BUILDER_PID 2>/dev/null || true
-	echo "Available nodes:"
-	ngctl list
-	exit 1
-fi
 
 echo "Topology created successfully!"
 echo ""

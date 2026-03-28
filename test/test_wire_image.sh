@@ -15,6 +15,9 @@ NC='\033[0m' # No Color
 SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
 MODULE_DIR=$(dirname "$SCRIPT_DIR")
 
+# Source test helper functions
+. "${SCRIPT_DIR}/test_helpers.sh"
+
 printf "${YELLOW}=== Wire Image Verification Test ===${NC}\n\n"
 
 # Build ng_builder_generic if needed
@@ -31,7 +34,10 @@ fi
 printf "Loading modules...\n"
 kldunload ng_mbuf_inject 2>/dev/null || true
 kldunload ng_mss_rewrite 2>/dev/null || true
-sleep 1
+
+# Wait for modules to be fully unloaded
+wait_for_module_unload ng_mbuf_inject 2 || true
+wait_for_module_unload ng_mss_rewrite 2 || true
 
 if ! kldload ${MODULE_DIR}/ng_mss_rewrite.ko; then
     printf "${RED}Failed to load ng_mss_rewrite${NC}\n"
@@ -64,26 +70,18 @@ printf "Creating netgraph topology...\n"
 ${SCRIPT_DIR}/ng_builder_generic wire_verify &
 BUILDER_PID=$!
 
-# Wait for topology to be created
-sleep 2
+# Wait for topology to be created (poll for nodes)
+if ! wait_for_nodes 5 wire_verify_inject: wire_verify_mss:; then
+    printf "${RED}Timeout waiting for topology nodes to be created${NC}\n"
+    ngctl list
+    kill $BUILDER_PID 2>/dev/null || true
+    exit 1
+fi
 
 # Check if builder process is still running
 if ! kill -0 $BUILDER_PID 2>/dev/null; then
     printf "${RED}ng_builder_wire_verify process died unexpectedly${NC}\n"
     wait $BUILDER_PID
-    exit 1
-fi
-
-# Verify nodes exist
-if ! ngctl show wire_verify_inject: >/dev/null 2>&1; then
-    printf "${RED}wire_verify_inject node not found${NC}\n"
-    ngctl list
-    exit 1
-fi
-
-if ! ngctl show wire_verify_mss: >/dev/null 2>&1; then
-    printf "${RED}wire_verify_mss node not found${NC}\n"
-    ngctl list
     exit 1
 fi
 
@@ -104,11 +102,18 @@ test_mss_rewrite() {
     printf "\n${YELLOW}Test: ${test_name}${NC}\n"
     printf "  Original MSS: %d, Expected MSS: %d\n" $orig_mss $expected_mss
 
+    # Get initial packets_sent counter
+    sent_before=$(ngctl msg wire_verify_inject: getstats 2>&1 | grep -o 'packets_sent=[0-9]*' | cut -d= -f2)
+    [ -z "$sent_before" ] && sent_before=0
+
     # Inject packet with original MSS
     ngctl msg wire_verify_inject: inject_single "{ mss=$orig_mss ipv6=0 split_offset=0 csum_flags=0 ext_type=0 }" >/dev/null 2>&1
 
-    # Small delay to ensure packet is processed
-    sleep 0.1
+    # Poll for packet to be sent and received back
+    if ! wait_for_packet_sent wire_verify_inject: $sent_before 1; then
+        printf "  ${RED}FAIL: Packet injection timed out${NC}\n"
+        return 1
+    fi
 
     # Get last received packet info
     result=$(ngctl msg wire_verify_inject: getlastpkt 2>&1)

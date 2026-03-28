@@ -21,6 +21,9 @@ cd "$SCRIPT_DIR" || {
 	exit 1
 }
 
+# Source test helper functions
+. "${SCRIPT_DIR}/test_helpers.sh"
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -53,7 +56,6 @@ cleanup() {
 	done
 	# Kill any stray ng_builder_mbuf processes
 	pkill -f ng_builder_mbuf 2>/dev/null || true
-	sleep 1
 }
 
 # Trap cleanup on exit
@@ -103,18 +105,11 @@ run_inject_test() {
 		return 1
 	fi
 
-	# Check if packet was sent
-	INJECT_AFTER=$(ngctl msg mbuf_test_inject: getstats 2>&1)
-	SENT_AFTER=$(echo "$INJECT_AFTER" | grep -o 'packets_sent=[0-9]*' | cut -d= -f2)
-	[ -z "$SENT_AFTER" ] && SENT_AFTER=0
-
-	if [ "$SENT_AFTER" -le "$SENT_BEFORE" ]; then
-		fail_test "$test_name: packet not sent (before=$SENT_BEFORE, after=$SENT_AFTER)"
+	# Poll for packet to be sent
+	if ! wait_for_packet_sent mbuf_test_inject: $SENT_BEFORE 1; then
+		fail_test "$test_name: packet injection timed out"
 		return 1
 	fi
-
-	# Give time for processing
-	sleep 0.1
 
 	# Check results
 	STATS=$(ngctl msg mbuf_test_mss: getstats 2>&1)
@@ -174,8 +169,9 @@ echo "Loading kernel modules..."
 
 # Unload any existing modules first to ensure clean state
 kldunload ng_mbuf_inject 2>/dev/null || true
+wait_for_module_unload ng_mbuf_inject 2 || true
 kldunload ng_mss_rewrite 2>/dev/null || true
-sleep 1
+wait_for_module_unload ng_mss_rewrite 2 || true
 
 # Load ng_mss_rewrite
 echo "Loading ng_mss_rewrite..."
@@ -228,7 +224,6 @@ echo "Checking for existing nodes..."
 if ngctl show mbuf_test_inject: >/dev/null 2>&1; then
 	echo "WARNING: mbuf_test_inject still exists, forcing removal..."
 	ngctl shutdown mbuf_test_inject: 2>/dev/null || true
-	sleep 1
 fi
 
 # Build ng_builder_generic if needed
@@ -246,7 +241,13 @@ echo "Starting topology builder..."
 BUILDER_PID=$!
 
 # Wait for topology to be created
-sleep 3
+if ! wait_for_nodes 5 mbuf_test_inject: mbuf_test_mss: mbuf_test_hole:; then
+	echo "ERROR: Timeout waiting for test topology nodes to be created"
+	kill $BUILDER_PID 2>/dev/null || true
+	echo "Available nodes:"
+	ngctl list
+	exit 1
+fi
 
 # Check if builder process is still running
 if ! kill -0 $BUILDER_PID 2>/dev/null; then
@@ -255,31 +256,6 @@ if ! kill -0 $BUILDER_PID 2>/dev/null; then
 	exit 1
 fi
 echo "Builder process running (PID: $BUILDER_PID)"
-
-# Verify nodes exist
-if ! ngctl show mbuf_test_inject: >/dev/null 2>&1; then
-	echo "ERROR: mbuf_test_inject node not found"
-	kill $BUILDER_PID 2>/dev/null || true
-	echo "Available nodes:"
-	ngctl list
-	exit 1
-fi
-
-if ! ngctl show mbuf_test_mss: >/dev/null 2>&1; then
-	echo "ERROR: mbuf_test_mss node not found"
-	kill $BUILDER_PID 2>/dev/null || true
-	echo "Available nodes:"
-	ngctl list
-	exit 1
-fi
-
-if ! ngctl show mbuf_test_hole: >/dev/null 2>&1; then
-	echo "ERROR: mbuf_test_hole node not found"
-	kill $BUILDER_PID 2>/dev/null || true
-	echo "Available nodes:"
-	ngctl list
-	exit 1
-fi
 
 echo "Topology created successfully!"
 echo ""
@@ -298,8 +274,10 @@ ngctl msg mbuf_test_mss: setdirection "{ enable_lower=1 enable_upper=1 }"
 
 # Check if debug statistics are enabled in the module
 # Run a dummy test to generate some stats, then check for debug fields
+DUMMY_BEFORE=$(ngctl msg mbuf_test_inject: getstats 2>&1 | grep -o 'packets_sent=[0-9]*' | cut -d= -f2)
+[ -z "$DUMMY_BEFORE" ] && DUMMY_BEFORE=0
 ngctl msg mbuf_test_inject: inject_single "{ mss=1460 ipv6=0 split_offset=0 csum_flags=0 ext_type=0 }" >/dev/null 2>&1
-sleep 0.1
+wait_for_packet_sent mbuf_test_inject: $DUMMY_BEFORE 1 || true
 STATS_CHECK=$(ngctl msg mbuf_test_mss: getstats 2>&1)
 ngctl msg mbuf_test_mss: resetstats >/dev/null 2>&1
 
