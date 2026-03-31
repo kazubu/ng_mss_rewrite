@@ -371,8 +371,9 @@ echo "=========================================="
 run_inject_test "inject_fragmented" "{ mss=1200 ipv6=0 split_offset=14 csum_flags=0 ext_type=0 }" 1 0 "Fragmented mbuf, MSS=1200 (<= 1400): processed but not rewritten" "skip_mss_ok" 1
 
 # Test: Fragmented + Shared (most complex case)
-# Note: This is complex to create and test, so we skip it for now
-skip_test "Fragmented + Shared mbuf (complex case, not implemented in injector)"
+# This tests the most complex scenario: mbuf chain that is both fragmented AND shared
+# Requires both m_pullup() (for fragmentation) and m_unshare() (for shared data)
+run_inject_test "inject_fragmented_shared" "{ mss=1460 ipv6=0 split_offset=14 csum_flags=0 ext_type=0 }" 1 1 "Fragmented + Shared mbuf, MSS=1460 (> 1400): requires pullup + unshare"
 
 echo ""
 echo "=========================================="

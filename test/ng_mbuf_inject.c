@@ -47,6 +47,7 @@ enum {
 	NGM_MBUF_INJECT_SINGLE = 1,	/* Send single contiguous mbuf packet */
 	NGM_MBUF_INJECT_FRAGMENTED,	/* Send multi-mbuf chain packet */
 	NGM_MBUF_INJECT_SHARED,		/* Send shared (read-only) mbuf packet */
+	NGM_MBUF_INJECT_FRAGMENTED_SHARED,	/* Send fragmented+shared mbuf chain */
 	NGM_MBUF_INJECT_OFFLOAD,	/* Send packet with checksum offload flags */
 	NGM_MBUF_INJECT_IPV6EXT,	/* Send IPv6 packet with extension headers */
 	NGM_MBUF_INJECT_GETSTATS,	/* Get statistics */
@@ -136,6 +137,13 @@ static const struct ng_cmdlist ng_mbuf_inject_cmdlist[] = {
 		NGM_MBUF_INJECT_COOKIE,
 		NGM_MBUF_INJECT_SHARED,
 		"inject_shared",
+		&ng_mbuf_inject_params_type,
+		NULL
+	},
+	{
+		NGM_MBUF_INJECT_COOKIE,
+		NGM_MBUF_INJECT_FRAGMENTED_SHARED,
+		"inject_fragmented_shared",
 		&ng_mbuf_inject_params_type,
 		NULL
 	},
@@ -437,6 +445,115 @@ inject_shared(priv_p priv, struct ng_mbuf_inject_params *params)
 }
 
 /*
+ * Inject fragmented + shared mbuf chain packet
+ * This creates the most complex case: requires both m_pullup() and m_unshare()
+ */
+static int
+inject_fragmented_shared(priv_p priv, struct ng_mbuf_inject_params *params)
+{
+	struct mbuf *m, *m2, *m3, *m_copy;
+	int split_offset;
+	int total_len;
+	uint8_t *src_data;
+
+	/* Free any previously held mbuf */
+	if (priv->held_mbuf != NULL) {
+		m_freem(priv->held_mbuf);
+		priv->held_mbuf = NULL;
+	}
+
+	/* Build the packet first */
+	m = build_tcp_syn_packet(params->ipv6, params->mss);
+	if (m == NULL)
+		return (ENOMEM);
+
+	total_len = m->m_pkthdr.len;
+
+	/* Determine split offset */
+	if (params->split_offset != 0) {
+		split_offset = params->split_offset;
+	} else {
+		/* Default: split at Ethernet header boundary (after 14 bytes) */
+		split_offset = 14;
+	}
+
+	/* Validate split offset */
+	if (split_offset >= total_len || split_offset <= 0) {
+		/* Invalid split, just make it shared without fragmentation */
+		m_copy = m_copym(m, 0, M_COPYALL, M_NOWAIT);
+		if (m_copy == NULL) {
+			m_freem(m);
+			return (ENOMEM);
+		}
+		priv->held_mbuf = m;
+		m = m_copy;
+		goto send_packet;
+	}
+
+	/* Save the packet data */
+	src_data = mtod(m, uint8_t *);
+
+	/* Create first mbuf (for data before split point) */
+	m2 = m_gethdr(M_NOWAIT, MT_DATA);
+	if (m2 == NULL) {
+		m_freem(m);
+		return (ENOMEM);
+	}
+
+	/* Copy packet header from original */
+	m2->m_pkthdr.len = total_len;
+	m2->m_len = split_offset;
+	memcpy(mtod(m2, caddr_t), src_data, split_offset);
+
+	/* Create second mbuf (for data after split point) */
+	m3 = m_get(M_NOWAIT, MT_DATA);
+	if (m3 == NULL) {
+		m_freem(m2);
+		m_freem(m);
+		return (ENOMEM);
+	}
+
+	m3->m_len = total_len - split_offset;
+	memcpy(mtod(m3, caddr_t), src_data + split_offset, m3->m_len);
+
+	/* Link them together */
+	m2->m_next = m3;
+
+	/* Now make the fragmented chain shared */
+	/* Create a copy that shares the cluster data */
+	m_copy = m_copym(m2, 0, M_COPYALL, M_NOWAIT);
+	if (m_copy == NULL) {
+		m_freem(m2);
+		m_freem(m);
+		return (ENOMEM);
+	}
+
+	/* Hold original fragmented chain to keep refcount > 1 */
+	/* Free the original single mbuf since we replaced it with m2 */
+	m_freem(m);
+	priv->held_mbuf = m2;	/* Hold fragmented original */
+
+	/* Use the shared copy of the fragmented chain */
+	m = m_copy;
+
+send_packet:
+
+	/* Send to output hook */
+	if (priv->output != NULL) {
+		int error;
+		NG_SEND_DATA_ONLY(error, priv->output, m);
+		if (error == 0)
+			priv->packets_sent++;
+		return (error);
+	} else {
+		m_freem(m);
+		m_freem(priv->held_mbuf);
+		priv->held_mbuf = NULL;
+		return (ENOTCONN);
+	}
+}
+
+/*
  * Inject packet with checksum offload flags
  */
 static int
@@ -624,6 +741,20 @@ ng_mbuf_inject_rcvmsg(node_p node, item_p item, hook_p lasthook)
 
 			params = (struct ng_mbuf_inject_params *)msg->data;
 			error = inject_shared(priv, params);
+			break;
+		}
+
+		case NGM_MBUF_INJECT_FRAGMENTED_SHARED:
+		{
+			struct ng_mbuf_inject_params *params;
+
+			if (msg->header.arglen != sizeof(*params)) {
+				error = EINVAL;
+				break;
+			}
+
+			params = (struct ng_mbuf_inject_params *)msg->data;
+			error = inject_fragmented_shared(priv, params);
 			break;
 		}
 
