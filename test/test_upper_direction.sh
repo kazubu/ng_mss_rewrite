@@ -296,15 +296,15 @@ echo ""
 echo "=========================================="
 echo "  Test Summary"
 echo "=========================================="
-echo "Total:  $TESTS_TOTAL"
-echo "Passed: ${GREEN}$TESTS_PASSED${NC}"
-echo "Failed: ${RED}$TESTS_FAILED${NC}"
+printf "Total:  $TESTS_TOTAL\n"
+printf "Passed: ${GREEN}$TESTS_PASSED${NC}\n"
+printf "Failed: ${RED}$TESTS_FAILED${NC}\n"
 echo ""
 
 if [ "$TESTS_FAILED" -eq 0 ]; then
-	echo "${GREEN}All tests passed!${NC}"
+	printf "${GREEN}All tests passed!${NC}\n"
 	exit 0
 else
-	echo "${RED}Some tests failed!${NC}"
+	printf "${RED}Some tests failed!${NC}\n"
 	exit 1
 fi

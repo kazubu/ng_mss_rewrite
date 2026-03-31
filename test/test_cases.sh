@@ -41,7 +41,7 @@ fail_test() {
 }
 
 skip_test() {
-    echo "${YELLOW}⊘ SKIP${NC}: $1"
+    printf "${YELLOW}⊘ SKIP${NC}: $1\n"
 }
 
 # Cleanup function
