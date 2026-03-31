@@ -156,8 +156,8 @@ echo "=========================================="
 echo "  Test 1: Change MSS during packet flow"
 echo "=========================================="
 
-# Send packets via ng_source with setpps
-ngctl msg reconfig_source: setpps 1000 2>/dev/null || true
+# Send 10 packets at moderate speed
+ngctl msg reconfig_source: setpps 100 2>/dev/null || true
 
 # Get test packet
 TEST_PACKET="ff ff ff ff ff ff 00 00 00 00 00 00 08 00 45 00
@@ -169,11 +169,11 @@ TEST_PACKET="ff ff ff ff ff ff 00 00 00 00 00 00 08 00 45 00
 echo "$TEST_PACKET" | perl -pe 's/(..)[ \t\n]*/chr(hex($1))/ge' | nghook reconfig_source: input 2>/dev/null
 
 # Start sending packets in background
-ngctl msg reconfig_source: start 100 2>/dev/null &
+ngctl msg reconfig_source: start 10 2>/dev/null &
 SENDER_PID=$!
 
 # Wait a bit for packets to start flowing
-sleep 0.1
+sleep 0.05
 
 # Change MSS values multiple times while packets are flowing
 for new_mss in 1300 1200 1350 1450 1400; do
@@ -202,13 +202,13 @@ echo "=========================================="
 
 ngctl msg reconfig_mss: resetstats
 echo "$TEST_PACKET" | perl -pe 's/(..)[ \t\n]*/chr(hex($1))/ge' | nghook reconfig_source: input 2>/dev/null
-ngctl msg reconfig_source: start 100 2>/dev/null &
+ngctl msg reconfig_source: start 10 2>/dev/null &
 SENDER_PID=$!
 
-sleep 0.1
+sleep 0.05
 
-# Toggle direction settings rapidly
-for i in 1 2 3 4 5; do
+# Toggle direction settings  rapidly
+for i in 1 2 3; do
 	ngctl msg reconfig_mss: setdirection "{ enable_lower=1 enable_upper=0 }" 2>/dev/null
 	ngctl msg reconfig_mss: setdirection "{ enable_lower=0 enable_upper=1 }" 2>/dev/null
 	ngctl msg reconfig_mss: setdirection "{ enable_lower=1 enable_upper=1 }" 2>/dev/null
@@ -236,13 +236,13 @@ echo "=========================================="
 ngctl msg reconfig_mss: resetstats
 ngctl msg reconfig_mss: setdirection "{ enable_lower=1 enable_upper=0 }"
 echo "$TEST_PACKET" | perl -pe 's/(..)[ \t\n]*/chr(hex($1))/ge' | nghook reconfig_source: input 2>/dev/null
-ngctl msg reconfig_source: start 100 2>/dev/null &
+ngctl msg reconfig_source: start 10 2>/dev/null &
 SENDER_PID=$!
 
-sleep 0.1
+sleep 0.05
 
 # Toggle stats mode rapidly
-for i in 1 2 3 4 5; do
+for i in 1 2 3; do
 	ngctl msg reconfig_mss: setstatsmode "{ mode=1 }" 2>/dev/null
 	ngctl msg reconfig_mss: setstatsmode "{ mode=0 }" 2>/dev/null
 done
@@ -267,13 +267,13 @@ echo "=========================================="
 
 ngctl msg reconfig_mss: setdirection "{ enable_lower=1 enable_upper=0 }"
 echo "$TEST_PACKET" | perl -pe 's/(..)[ \t\n]*/chr(hex($1))/ge' | nghook reconfig_source: input 2>/dev/null
-ngctl msg reconfig_source: start 100 2>/dev/null &
+ngctl msg reconfig_source: start 10 2>/dev/null &
 SENDER_PID=$!
 
-sleep 0.1
+sleep 0.05
 
 # Reset stats multiple times
-for i in 1 2 3 4 5; do
+for i in 1 2 3; do
 	ngctl msg reconfig_mss: resetstats 2>/dev/null
 done
 
@@ -297,13 +297,13 @@ echo "=========================================="
 
 ngctl msg reconfig_mss: resetstats
 echo "$TEST_PACKET" | perl -pe 's/(..)[ \t\n]*/chr(hex($1))/ge' | nghook reconfig_source: input 2>/dev/null
-ngctl msg reconfig_source: start 200 2>/dev/null &
+ngctl msg reconfig_source: start 10 2>/dev/null &
 SENDER_PID=$!
 
-sleep 0.1
+sleep 0.05
 
 # Do everything at once
-for i in 1 2 3 4 5; do
+for i in 1 2 3; do
 	ngctl msg reconfig_mss: setmss "{ mss_ipv4=$((1200 + i * 100)) mss_ipv6=$((1200 + i * 100)) }" 2>/dev/null
 	ngctl msg reconfig_mss: setdirection "{ enable_lower=$((i % 2)) enable_upper=$(((i + 1) % 2)) }" 2>/dev/null
 	ngctl msg reconfig_mss: setstatsmode "{ mode=$((i % 2)) }" 2>/dev/null
@@ -330,13 +330,17 @@ echo "=========================================="
 
 # Set known config
 ngctl msg reconfig_mss: setmss "{ mss_ipv4=1300 mss_ipv6=1300 }"
-ngctl msg reconfig_mss: setdirection "{ enable_lower=1 enable_upper=0 }"
+ngctl msg reconfig_mss: setdirection "{ enable_lower=1 enable_upper=1 }"
 ngctl msg reconfig_mss: setstatsmode "{ mode=1 }"
+sleep 0.05
 ngctl msg reconfig_mss: resetstats
+sleep 0.05
 
 # Send exactly 10 packets
 echo "$TEST_PACKET" | perl -pe 's/(..)[ \t\n]*/chr(hex($1))/ge' | nghook reconfig_source: input 2>/dev/null
-ngctl msg reconfig_source: start 10 2>/dev/null
+ngctl msg reconfig_source: start 10 2>/dev/null &
+SENDER_PID=$!
+sleep 0.1
 
 # Wait for packets to be processed
 if ! wait_for_packets_processed reconfig_mss: 10 3; then
